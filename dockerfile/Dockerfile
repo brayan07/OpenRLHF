@@ -18,7 +18,7 @@ RUN pip uninstall xgboost transformer_engine flash_attn pynvml opencv-python-hea
 RUN pip install flash-attn==2.8.2
 RUN pip install vllm==0.10.0
 
-COPY docker-entrypoint.sh .
+COPY dockerfile/docker-entrypoint.sh .
 RUN chmod a+x docker-entrypoint.sh
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

@@ -429,6 +429,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval_n_samples_per_prompt", type=int, default=4, help="Number of samples per prompt for evaluation"
     )
+    parser.add_argument("--eval_upon_start", action="store_true", default=False)
 
     parser.add_argument("--input_key", type=str, default="input", help="JSON dataset key")
     parser.add_argument("--label_key", type=str, default=None, help="JSON dataset key")
@@ -526,7 +527,7 @@ if __name__ == "__main__":
         assert not args.vllm_enable_sleep, "Async RLHF is not supported with --vllm_enable_sleep."
 
     if args.eval_dataset:
-        assert args.remote_rm_url, "`--eval_dataset` is only supported with `--remote_rm_url`."
+        assert args.remote_rm_url or args.agent_func_path, "`--eval_dataset` is only supported with `--remote_rm_url`. or `--agent_func_path`"
 
     if args.use_kl_loss:
         if args.kl_estimator not in ["k2", "k3"]:

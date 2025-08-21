@@ -447,6 +447,11 @@ class PPOTrainer(BasePPOTrainer):
         else:
             checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}}
 
+        # If specified eval before training, evaluate
+        if getattr(args, "eval_upon_start", None):
+            self.evaluate(self.eval_dataloader, checkpoint_states["global_step"], self.args.eval_temperature, self.args.eval_n_samples_per_prompt)
+
+
         # Restore step and start_epoch
         steps = checkpoint_states["global_step"] + 1
         episode = checkpoint_states["episode"]
