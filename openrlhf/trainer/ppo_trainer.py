@@ -174,7 +174,8 @@ class BasePPOTrainer(ABC):
                     new_table = self._wandb.Table(
                         columns=self.generated_samples_table.columns, data=self.generated_samples_table.data
                     )
-                    new_table.add_data(global_step, *logs_dict.pop("generated_samples"))
+                    for record in logs_dict["generated_samples"]:
+                        new_table.add_data(global_step, *record)
                     self.generated_samples_table = new_table
                     self._wandb.log({"train/generated_samples": new_table})
                 logs = {
@@ -509,10 +510,20 @@ class PPOTrainer(BasePPOTrainer):
                     number_of_samples = 0
 
                 experiences = self.experience_maker.make_experience_batch(rollout_samples)
-                sample0 = self.tokenizer.batch_decode(
-                    experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True
-                )
-                print(sample0)
+
+                # Select 3 samples to log
+                sample_indices = [0, (len(experiences)-1)//2, len(experiences)-1]
+                sample_indices = list(set(sample_indices))
+                logging_samples = []
+                for i in sample_indices:
+                    logging_samples.append([
+                                self.tokenizer.batch_decode(
+                                experiences[i].sequences[0].unsqueeze(0), skip_special_tokens=True
+                                ),
+                                experiences[i].info["reward"][0]
+                    ])
+
+
 
                 # balance experiences across dp
                 if args.use_dynamic_batch:
@@ -534,7 +545,7 @@ class PPOTrainer(BasePPOTrainer):
                 if self.args.dynamic_filtering:
                     status["dynamic_filtering_pass_rate"] = pass_rate
                 logger.info(f"✨ Global step {steps}: {status}")
-                status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
+                status["generated_samples"] = logging_samples
 
                 # logs/checkpoints
                 client_states = {

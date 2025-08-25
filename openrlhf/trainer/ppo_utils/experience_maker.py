@@ -451,7 +451,7 @@ class RemoteExperienceMaker(ABC):
         self.remote_reward_model = remote_reward_model
         self.tokenizer = tokenizer
 
-    def split_rollout_samples(self, rollout_samples):
+    def split_rollout_samples(self, rollout_samples: List[Experience]):
         for i, sample in enumerate(rollout_samples):
             sample.index = [i]
 
