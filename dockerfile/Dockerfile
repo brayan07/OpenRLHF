@@ -22,3 +22,4 @@ COPY dockerfile/docker-entrypoint.sh .
 RUN chmod a+x docker-entrypoint.sh
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
+
