@@ -1,5 +1,6 @@
 import os
 import time
+from copy import deepcopy
 from abc import ABC
 from datetime import timedelta
 
@@ -16,6 +17,7 @@ from openrlhf.trainer.ray.launcher import RayActorGroup
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.utils import get_tokenizer
+from openrlhf.utils.experience_logger import ExperienceDiskLogger
 
 logger = init_logger(__name__)
 
@@ -432,6 +434,17 @@ class PPOTrainer(BasePPOTrainer):
         if self.args.save_steps == -1:
             self.args.save_steps = float("inf")  # do not save ckpt
 
+        # Initialize async disk logger if enabled
+        self._exp_logger = None
+        try:
+            if getattr(self.args, "log_experience_dir", None):
+                self._exp_logger = ExperienceDiskLogger.remote(
+                    self.args.log_experience_dir, getattr(self.args, "log_experience_jsonl", False)
+                )
+                self._log_every = max(1, int(getattr(self.args, "log_experience_every", 1)))
+        except Exception as e:
+            logger.warning(f"Failed to initialize ExperienceDiskLogger: {e}")
+
     def fit(
         self,
     ) -> None:
@@ -510,6 +523,27 @@ class PPOTrainer(BasePPOTrainer):
                     number_of_samples = 0
 
                 experiences = self.experience_maker.make_experience_batch(rollout_samples)
+
+                # Asynchronous disk logging of rollouts and experiences before any rebalancing
+                if self._exp_logger and steps % self._log_every == 0:
+                    try:
+                        rollout_records = []
+                        for s in rollout_samples:
+                            sc = deepcopy(s)
+                            sc.to_cpu_detached()
+                            rollout_records.append(sc.to_serializable_dict())
+
+                        experience_records = []
+                        for e in experiences:
+                            ec = deepcopy(e)
+                            ec.to_cpu_detached()
+                            experience_records.append(ec.to_serializable_dict())
+
+                        # Fire-and-forget async writes
+                        self._exp_logger.log_rollouts.remote(steps, rollout_records)
+                        self._exp_logger.log_experiences.remote(steps, experience_records)
+                    except Exception as e:
+                        logger.warning(f"Experience logging failed at step {steps}: {e}")
 
                 # Select 3 samples to log
                 sample_indices = [0, (len(experiences)-1)//2, len(experiences)-1]

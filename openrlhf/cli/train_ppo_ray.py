@@ -187,7 +187,7 @@ def train(args):
         ray.get(critic_model.async_save_model())
 
 
-if __name__ == "__main__":
+def get_parser():
     parser = argparse.ArgumentParser()
     # Ray and vLLM
     parser.add_argument("--ref_num_nodes", type=int, default=1, help="number of nodes for reference")
@@ -257,6 +257,10 @@ if __name__ == "__main__":
     parser.add_argument("--eval_steps", type=int, default=-1)
     parser.add_argument("--save_steps", type=int, default=-1)
     parser.add_argument("--logging_steps", type=int, default=1)
+    # Experience logging knobs
+    parser.add_argument("--log_experience_dir", type=str, default=None, help="Directory to write rollouts/experiences dumps")
+    parser.add_argument("--log_experience_every", type=int, default=1, help="Write dumps every N steps")
+    parser.add_argument("--log_experience_jsonl", action="store_true", default=False, help="Also write JSONL summaries")
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_ppo_ray")
     parser.add_argument("--save_hf_ckpt", action="store_true", default=False)
     parser.add_argument("--disable_ds_ckpt", action="store_true", default=False)
@@ -464,6 +468,11 @@ if __name__ == "__main__":
     # ModelScope parameters
     parser.add_argument("--use_ms", action="store_true", default=False)
 
+    return parser
+
+
+if __name__ == "__main__":
+    parser = get_parser()
     args = parser.parse_args()
 
     # Validate arguments

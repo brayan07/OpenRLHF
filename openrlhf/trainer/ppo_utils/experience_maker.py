@@ -116,6 +116,51 @@ class Experience:
 
         return self
 
+    def to_cpu_detached(self):
+        """Convert all tensor fields (including nested in info dict) to CPU and detach from autograd.
+
+        Returns self to allow chaining.
+        """
+        for field, value in self.__dict__.items():
+            if isinstance(value, dict):
+                new_dict = {}
+                for k, v in value.items():
+                    if isinstance(v, torch.Tensor):
+                        new_dict[k] = v.detach().to("cpu")
+                    else:
+                        new_dict[k] = v
+                setattr(self, field, new_dict)
+            elif isinstance(value, torch.Tensor):
+                setattr(self, field, value.detach().to("cpu"))
+            else:
+                setattr(self, field, value)
+
+        return self
+
+    def to_serializable_dict(self):
+        """Return a plain dict view of this Experience suitable for torch.save.
+
+        Assumes tensors were already moved to CPU/detached if desired.
+        """
+        return {
+            "index": self.index,
+            "sequences": self.sequences,
+            "attention_mask": self.attention_mask,
+            "action_mask": self.action_mask,
+            "action_log_probs": self.action_log_probs,
+            "base_action_log_probs": self.base_action_log_probs,
+            "rollout_log_probs": self.rollout_log_probs,
+            "values": self.values,
+            "returns": self.returns,
+            "advantages": self.advantages,
+            "kl": self.kl,
+            "prompts": self.prompts,
+            "labels": self.labels,
+            "rewards": self.rewards,
+            "scores": self.scores,
+            "info": self.info,
+        }
+
     def pin_memory(self):
         """Pin memory for all tensor fields."""
         for field, value in self.__dict__.items():
