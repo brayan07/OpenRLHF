@@ -260,7 +260,7 @@ def get_parser():
     # Experience logging knobs
     parser.add_argument("--log_experience_dir", type=str, default=None, help="Directory to write rollouts/experiences dumps")
     parser.add_argument("--log_experience_every", type=int, default=1, help="Write dumps every N steps")
-    parser.add_argument("--log_experience_jsonl", action="store_true", default=False, help="Also write JSONL summaries")
+    parser.add_argument("--log_experience_jsonl", action="store_true", default=True, help="Also write JSONL summaries")
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_ppo_ray")
     parser.add_argument("--save_hf_ckpt", action="store_true", default=False)
     parser.add_argument("--disable_ds_ckpt", action="store_true", default=False)

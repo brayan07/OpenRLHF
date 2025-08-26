@@ -552,7 +552,7 @@ class PPOTrainer(BasePPOTrainer):
                 for i in sample_indices:
                     logging_samples.append([
                                 self.tokenizer.batch_decode(
-                                experiences[i].sequences[0].unsqueeze(0), skip_special_tokens=True
+                                experiences[i].sequences[0].unsqueeze(0), skip_special_tokens=False
                                 ),
                                 experiences[i].info["reward"][0]
                     ])
