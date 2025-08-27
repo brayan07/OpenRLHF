@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  openrlhf-dev:
+    image: openrlhf-dev
+    build:
+      context: .
+      dockerfile: dockerfile/Dockerfile-dev
+      args:
+        BASE_IMAGE: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
+        USER_ID: ${USER_ID}
+        GROUP_ID: ${GROUP_ID}
+        USERNAME: ubuntu
+    container_name: openrlhf-dev
+    # Enable interactive dev
+    stdin_open: true
+    tty: true
+    init: true
+    # GPU access (works with recent Docker + Compose)
+#    gpus: all
+    shm_size: "8gb"
+    environment:
+      # EntryPoint expects these to create a matching user
+      - LOCAL_USER=${USER:-developer}
+      - LOCAL_USER_ID=${UID:-1000}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TZ=${TZ:-UTC}
+    working_dir: /app/OpenRLHF
+    volumes:
+      - .:/app/OpenRLHF
+      - ~/.cache/huggingface:/home/ubuntu/.cache/huggingface
+      # Optional: persist pip cache to speed up installs (uncomment if desired)
+      # - pip-cache:/home/${USER:-developer}/.cache/pip
+    # Common dev ports; comment out what you don't need
+    command: ["bash"]
