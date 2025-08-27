@@ -26,6 +26,19 @@ def get_tokenizer(pretrain, model, padding_side="left", strategy=None, use_fast=
     tokenizer.padding_side = padding_side
     # NOTE: When enable vLLM, do not resize_token_embeddings, or the vocab size will mismatch with vLLM.
     # https://github.com/facebookresearch/llama-recipes/pull/196
+    # If user specifies a pad token string via CLI (available at strategy.args), validate and set it
+    if strategy is not None and hasattr(strategy, "args") and getattr(strategy.args, "pad_token_string", None):
+        pad_token_str = getattr(strategy.args, "pad_token_string")
+        token_ids = tokenizer.encode(pad_token_str, add_special_tokens=False)
+        if len(token_ids) != 1:
+            raise ValueError(
+                f"pad_token_string '{pad_token_str}' must map to exactly one token id, got ids={token_ids}"
+            )
+        tokenizer.pad_token = pad_token_str
+        tokenizer.pad_token_id = token_ids[0]
+        if model is not None:
+            model.config.pad_token_id = tokenizer.pad_token_id
+    # Otherwise, ensure pad token is set (fallback to eos)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id

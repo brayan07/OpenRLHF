@@ -340,6 +340,16 @@ def get_parser():
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
+    # Tokenization options
+    parser.add_argument(
+        "--pad_token_string",
+        type=str,
+        default=None,
+        help=(
+            "Custom pad token string to use. Must correspond to exactly one tokenizer id; "
+            "will set tokenizer.pad_token and tokenizer.pad_token_id accordingly."
+        ),
+    )
     parser.add_argument(
         "--full_determinism",
         action="store_true",
