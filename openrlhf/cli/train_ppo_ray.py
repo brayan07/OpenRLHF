@@ -347,7 +347,17 @@ def get_parser():
         default=None,
         help=(
             "Custom pad token id to use. Will set tokenizer.pad_token_id and attempt to set "
-            "tokenizer.pad_token accordingly. (Deprecated alternative: --pad_token_string)"
+            "tokenizer.pad_token accordingly. If both --pad_token_id and --pad_token_string are set, "
+            "they must map to each other or an error will be raised."
+        ),
+    )
+    parser.add_argument(
+        "--pad_token_string",
+        type=str,
+        default=None,
+        help=(
+            "Custom pad token string to use. Must correspond to exactly one tokenizer id. If both "
+            "--pad_token_id and --pad_token_string are set, they must map to each other or an error will be raised."
         ),
     )
     parser.add_argument(
