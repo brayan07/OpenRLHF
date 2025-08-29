@@ -342,12 +342,12 @@ def get_parser():
     parser.add_argument("--seed", type=int, default=42)
     # Tokenization options
     parser.add_argument(
-        "--pad_token_string",
-        type=str,
+        "--pad_token_id",
+        type=int,
         default=None,
         help=(
-            "Custom pad token string to use. Must correspond to exactly one tokenizer id; "
-            "will set tokenizer.pad_token and tokenizer.pad_token_id accordingly."
+            "Custom pad token id to use. Will set tokenizer.pad_token_id and attempt to set "
+            "tokenizer.pad_token accordingly. (Deprecated alternative: --pad_token_string)"
         ),
     )
     parser.add_argument(
