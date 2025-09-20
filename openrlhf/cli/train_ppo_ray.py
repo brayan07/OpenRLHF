@@ -3,6 +3,27 @@ from datetime import datetime
 
 import ray
 from ray.util.placement_group import placement_group
+# Optional imports for arc-agi curriculum controller integration. These are
+# guarded so OpenRLHF can run without arc-agi installed unless the feature is
+# explicitly enabled via CLI flags.
+try:  # noqa: E402
+    from arc_agi.ui.services.curriculum_service import (  # type: ignore
+        DEFAULT_DB_FILE as ARC_AGI_DEFAULT_DB_FILE,
+    )
+except Exception:  # pragma: no cover
+    ARC_AGI_DEFAULT_DB_FILE = None  # type: ignore
+try:  # noqa: E402
+    from arc_agi.agent_based_rl.agent_executor import (  # type: ignore
+        CURRICULUM_CONTROLLER_NAME as ARC_AGI_DEFAULT_CONTROLLER_NAME,
+    )
+except Exception:  # pragma: no cover
+    ARC_AGI_DEFAULT_CONTROLLER_NAME = "curriculum_controller"  # fallback
+try:  # noqa: E402
+    from arc_agi.agent_based_rl.curriculum.curriculum_controller_actor import (  # type: ignore
+        CurriculumControllerActor as ArcAgiCurriculumControllerActor,
+    )
+except Exception:  # pragma: no cover
+    ArcAgiCurriculumControllerActor = None  # type: ignore
 
 from openrlhf.trainer.ray import create_vllm_engines
 from openrlhf.trainer.ray.launcher import (
@@ -19,6 +40,40 @@ def train(args):
     # initialize ray if not initialized
     if not ray.is_initialized():
         ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}})
+
+    # Optionally start a detached arc-agi CurriculumController actor so that
+    # AgentExecutor in arc-agi can resolve it via ray.get_actor(name).
+    if getattr(args, "start_curriculum_controller", False):
+        controller_name = (
+            args.curriculum_controller_name
+            if getattr(args, "curriculum_controller_name", None)
+            else ARC_AGI_DEFAULT_CONTROLLER_NAME
+        )
+        # If already exists, skip creation.
+        try:
+            ray.get_actor(controller_name)
+        except ValueError:
+            # Need arc-agi installed to start the controller
+            if ArcAgiCurriculumControllerActor is None:
+                raise RuntimeError(
+                    "arc-agi is required to start CurriculumController. Install arc-agi or disable --start_curriculum_controller."
+                )
+            db_file = args.curriculum_db_file
+            if not db_file:
+                if ARC_AGI_DEFAULT_DB_FILE is None:
+                    raise RuntimeError(
+                        "No --curriculum_db_file provided and arc-agi default DB path is unavailable."
+                    )
+                db_file = ARC_AGI_DEFAULT_DB_FILE
+            # Create detached controller actor and start its async loop
+            ControllerRemote = ray.remote(ArcAgiCurriculumControllerActor)
+            controller = (
+                ControllerRemote.options(
+                    name=controller_name, lifetime="detached", scheduling_strategy="DEFAULT"
+                ).remote(storage_db_file=db_file, run_distributed=True)
+            )
+            # Ensure the internal async tasks are started
+            ray.get(controller.start.remote())
 
     # configure strategy
     strategy = get_strategy(args)
@@ -79,7 +134,7 @@ def train(args):
         args.actor_num_gpus_per_node,
         PolicyModelActor,
         pg=pg,
-        num_gpus_per_actor=0.2 if pg else 1,
+        num_gpus_per_actor=0.5 if pg else 1,
         duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
     )
 
@@ -91,7 +146,7 @@ def train(args):
             args.ref_num_gpus_per_node,
             ReferenceModelActor,
             pg=pg,
-            num_gpus_per_actor=0.2 if pg else 1,
+            num_gpus_per_actor=0.5 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
 
@@ -115,7 +170,7 @@ def train(args):
             args.critic_num_gpus_per_node,
             CriticModelActor,
             pg=pg,
-            num_gpus_per_actor=0.2 if pg else 1,
+            num_gpus_per_actor=0.5 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
     else:
@@ -129,7 +184,7 @@ def train(args):
             args.reward_num_gpus_per_node,
             RewardModelActor,
             pg=pg,
-            num_gpus_per_actor=0.2 if pg else 1,
+            num_gpus_per_actor=0.5 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
     else:
@@ -161,6 +216,11 @@ def train(args):
     )
     # training update steps
     max_steps = ray.get(ppo_trainer.get_max_steps.remote())
+
+    # Batch sleep engines
+    if args.vllm_enable_sleep:
+        from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
+        batch_vllm_engine_call(vllm_engines, "sleep")
 
     # init reference/reward/actor model
     refs = []
@@ -437,6 +497,32 @@ def get_parser():
     parser.add_argument("--value_head_prefix", type=str, default="score")
     parser.add_argument("--ref_reward_offload", action="store_true", default=False)
     parser.add_argument("--agent_func_path", type=str, default=None, help="Agent script path")
+    # arc-agi Curriculum Controller integration
+    parser.add_argument(
+        "--start_curriculum_controller",
+        action="store_true",
+        default=False,
+        help=(
+            "Start a detached arc-agi CurriculumController Ray actor so agent code can access it via name. "
+            "Requires arc-agi to be installed."
+        ),
+    )
+    parser.add_argument(
+        "--curriculum_db_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to curriculum SQLite DB file for arc-agi controller. If not set, uses arc-agi's default when available."
+        ),
+    )
+    parser.add_argument(
+        "--curriculum_controller_name",
+        type=str,
+        default=ARC_AGI_DEFAULT_CONTROLLER_NAME,
+        help=(
+            "Ray actor name for the detached CurriculumController. Agent will resolve it via ray.get_actor(name)."
+        ),
+    )
 
     # Custom dataset
     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")
@@ -501,6 +587,9 @@ if __name__ == "__main__":
 
     if args.agent_func_path:
         args.remote_rm_url = "agent"
+        # If user wants the curriculum controller, ensure the name is consistent
+        if args.start_curriculum_controller and not args.curriculum_controller_name:
+            args.curriculum_controller_name = ARC_AGI_DEFAULT_CONTROLLER_NAME
 
     if args.advantage_estimator not in ["gae"]:
         args.critic_pretrain = None

@@ -8,6 +8,14 @@ import ray
 import torch
 from tqdm import tqdm
 
+# Optional import for arc-agi curriculum controller name constant
+try:  # noqa: E402
+    from arc_agi.agent_based_rl.agent_executor import (  # type: ignore
+        CURRICULUM_CONTROLLER_NAME as ARC_AGI_DEFAULT_CONTROLLER_NAME,
+    )
+except Exception:  # pragma: no cover
+    ARC_AGI_DEFAULT_CONTROLLER_NAME = "curriculum_controller"
+
 from openrlhf.datasets import PromptDataset
 from openrlhf.datasets.utils import blending_datasets
 from openrlhf.trainer.ppo_utils import AdaptiveKLController, FixedKLController
@@ -224,11 +232,15 @@ class BasePPOTrainer(ABC):
         start_time = time.time()
         logger.info(f"⏰ Evaluation start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # vLLM wakeup when vllm_enable_sleep
-        if self.strategy.args.vllm_enable_sleep:
-            from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
-
-            batch_vllm_engine_call(self.vllm_engines, "wake_up")
+        # If using arc-agi AgentExecutor, temporarily switch curriculum controller to 'eval' mode
+        controller_actor = None
+        if getattr(self.args, "agent_func_path", None):
+            controller_name = getattr(
+                self.args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME
+            )
+            controller_actor = ray.get_actor(controller_name)
+            # strict=True to ensure barrier before proceeding
+            ray.get(controller_actor.set_mode.remote("eval", True))
 
         with torch.no_grad():
             # First collect all prompts and labels
@@ -300,8 +312,9 @@ class BasePPOTrainer(ABC):
                 for k, v in logs.items():
                     self._tensorboard.add_scalar(f"eval/{k}", v, global_step)
 
-        if self.strategy.args.vllm_enable_sleep:
-            batch_vllm_engine_call(self.vllm_engines, "sleep")
+        # Switch controller back to 'train' mode if we changed it
+        if controller_actor is not None:
+            ray.get(controller_actor.set_mode.remote("train", True))
 
         end_time = time.time()
         duration = end_time - start_time
