@@ -73,6 +73,7 @@ class ActorPPOTrainer(ABC):
             clip_eps_high=self.args.eps_clip_low_high[1],
             dual_clip=self.args.dual_clip,
             policy_loss_type=self.args.policy_loss_type,
+            enable_vllm_is_correction=self.args.enable_vllm_is_correction,
             vllm_is_truncated_threshold=(
                 self.args.vllm_is_truncated_threshold if self.args.enable_vllm_is_correction else None
             ),
@@ -403,7 +404,7 @@ class PolicyModelActor(BaseModelActor):
 
         actor = Actor(
             pretrain,
-            use_flash_attention_2=strategy.args.flash_attn,
+            attn_implementation=strategy.args.attn_implementation,
             bf16=strategy.args.bf16,
             load_in_4bit=strategy.args.load_in_4bit,
             lora_rank=strategy.args.lora_rank,
@@ -425,7 +426,7 @@ class PolicyModelActor(BaseModelActor):
         if args.enable_ema:
             ema_model = Actor(
                 pretrain,
-                use_flash_attention_2=strategy.args.flash_attn,
+                attn_implementation=strategy.args.attn_implementation,
                 bf16=strategy.args.bf16,
                 load_in_4bit=strategy.args.load_in_4bit,
                 ds_config=strategy.get_ds_eval_config(offload=True),
