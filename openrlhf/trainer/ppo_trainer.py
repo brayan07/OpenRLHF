@@ -535,6 +535,16 @@ class PPOTrainer(BasePPOTrainer):
                 desc=f"Episode [{episode + 1}/{args.num_episodes}]",
                 disable=False,
             )
+            # Curriculum-aware dynamic pbar total: set up controller and batch size if in curriculum mode
+            use_curriculum = getattr(self.args, "agent_func_path", None) is not None
+            controller = None
+            controller_name = None
+            batch_size_for_loader = None
+            if use_curriculum:
+                controller_name = getattr(self.args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME)
+                controller = ray.get_actor(controller_name)
+                # ArcAgiCurriculumIterable exposes target_item_count
+                batch_size_for_loader = getattr(self.prompts_dataloader, "target_item_count", None)
 
             filtered_samples = []
             number_of_samples = 0
@@ -544,6 +554,15 @@ class PPOTrainer(BasePPOTrainer):
                     rand_prompts, labels, remote_reward_model=remote_reward_model, **self.generate_kwargs
                 )
                 pbar.update()
+
+                # Periodically update progress bar total based on remaining prompts from controller
+                if use_curriculum and controller is not None and batch_size_for_loader:
+                    remaining_prompts = ray.get(controller.get_remaining_train_prompts.remote())
+                    remaining_batches = max(0, remaining_prompts // int(batch_size_for_loader))
+                    new_total = pbar.n + remaining_batches
+                    if pbar.total != new_total:
+                        pbar.total = new_total
+                        pbar.refresh()
 
                 # dynamic filtering
                 pass_rate = None
