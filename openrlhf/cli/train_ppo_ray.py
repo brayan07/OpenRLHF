@@ -323,6 +323,41 @@ def get_parser():
     # Async training using ray
     parser.add_argument("--async_train", action="store_true", default=False, help="Enable async training")
 
+    # Arc-AGI curriculum integration
+    parser.add_argument(
+        "--start_curriculum_controller",
+        action="store_true",
+        default=False,
+        help="Start an arc-agi CurriculumController as a detached Ray actor before training.",
+    )
+    parser.add_argument(
+        "--curriculum_controller_name",
+        type=str,
+        default=None,
+        help=(
+            "Ray actor name for the curriculum controller. If not provided and "
+            "--start_curriculum_controller is set, a default will be used."
+        ),
+    )
+    parser.add_argument(
+        "--curriculum_db_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to the curriculum controller SQLite DB file. If not provided, will use arc-agi's default "
+            "when available. Required if --start_curriculum_controller is set and arc-agi default is unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--challenges_dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory containing ARC challenge JSON files. Required when --start_curriculum_controller is set; "
+            "used to preload the controller."
+        ),
+    )
+
     # Checkpoints
     parser.add_argument("--eval_steps", type=int, default=-1)
     parser.add_argument("--save_steps", type=int, default=-1)
@@ -512,32 +547,6 @@ def get_parser():
     parser.add_argument("--value_head_prefix", type=str, default="score")
     parser.add_argument("--ref_reward_offload", action="store_true", default=False)
     parser.add_argument("--agent_func_path", type=str, default=None, help="Agent script path")
-    # arc-agi Curriculum Controller integration
-    parser.add_argument(
-        "--start_curriculum_controller",
-        action="store_true",
-        default=False,
-        help=(
-            "Start a detached arc-agi CurriculumController Ray actor so agent code can access it via name. "
-            "Requires arc-agi to be installed."
-        ),
-    )
-    parser.add_argument(
-        "--curriculum_db_file",
-        type=str,
-        default=None,
-        help=(
-            "Path to curriculum SQLite DB file for arc-agi controller. If not set, uses arc-agi's default when available."
-        ),
-    )
-    parser.add_argument(
-        "--curriculum_controller_name",
-        type=str,
-        default=ARC_AGI_DEFAULT_CONTROLLER_NAME,
-        help=(
-            "Ray actor name for the detached CurriculumController. Agent will resolve it via ray.get_actor(name)."
-        ),
-    )
 
     # Custom dataset
     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")
