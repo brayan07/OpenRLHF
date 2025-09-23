@@ -325,7 +325,42 @@ class BasePPOTrainer(ABC):
         args = self.args
         strategy = self.strategy
 
-        # prepare datasets
+        # ARC-AGI dynamic curriculum mode: if agent_func_path is provided, use controller-backed iterable
+        if getattr(args, "agent_func_path", None):
+            try:
+                # Late import so OpenRLHF remains usable without arc-agi installed
+                from arc_agi.agent_based_rl.curriculum.iterable_dataset import (
+                    ArcAgiCurriculumIterable,
+                )  # type: ignore
+            except Exception:
+                raise RuntimeError(
+                    "agent_func_path set but arc-agi curriculum iterable is unavailable. Ensure arc-agi is installed."
+                )
+
+            controller_name = getattr(args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME)
+
+            # Determine how many items to request per pull to satisfy static batch sizes
+            target_item_count = max(
+                args.rollout_batch_size,
+                args.vllm_generate_batch_size if args.vllm_generate_batch_size is not None else args.rollout_batch_size,
+                args.train_batch_size,
+            )
+
+            # Build train/eval iterables
+            prompts_dataloader = ArcAgiCurriculumIterable(controller_name, target_item_count, mode="train")
+            eval_dataloader = ArcAgiCurriculumIterable(controller_name, 1, mode="eval")
+
+            # Ask controller for a curriculum-based max_steps estimate
+            controller = ray.get_actor(controller_name)
+            self.max_steps = ray.get(
+                controller.estimate_max_steps.remote(args.rollout_batch_size, args.max_train_episodes_per_challenge)
+            )
+
+            self.prompts_dataloader = prompts_dataloader
+            self.eval_dataloader = eval_dataloader
+            return
+
+        # Default static dataset path
         train_data = blending_datasets(
             args.prompt_data,
             args.prompt_data_probs,
@@ -483,7 +518,15 @@ class PPOTrainer(BasePPOTrainer):
         steps = checkpoint_states["global_step"] + 1
         episode = checkpoint_states["episode"]
         data_loader_state_dict = checkpoint_states["data_loader_state_dict"]
-        if data_loader_state_dict:
+        controller_state = checkpoint_states.get("controller_state")
+
+        # If using arc-agi controller, restore controller state as well
+        if controller_state and getattr(args, "agent_func_path", None):
+            controller_name = getattr(self.args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME)
+            controller = ray.get_actor(controller_name)
+            # load is async; wait for completion to ensure deterministic continuation
+            ray.get(controller.load_curriculum_checkpoint.remote(controller_state))
+        elif data_loader_state_dict:
             self.prompts_dataloader.load_state_dict(data_loader_state_dict)
 
         for episode in range(episode, args.num_episodes):
@@ -598,8 +641,14 @@ class PPOTrainer(BasePPOTrainer):
                 client_states = {
                     "global_step": steps,
                     "episode": episode,
-                    "data_loader_state_dict": self.prompts_dataloader.state_dict(),
                 }
+                # Include controller checkpoint state if running with arc-agi dynamic curriculum
+                if getattr(self.args, "agent_func_path", None):
+                    controller_name = getattr(self.args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME)
+                    controller = ray.get_actor(controller_name)
+                    client_states["controller_state"] = ray.get(controller.save_curriculum_checkpoint.remote())
+                else:
+                    client_states["data_loader_state_dict"] = self.prompts_dataloader.state_dict()
                 self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
 
                 steps = steps + 1

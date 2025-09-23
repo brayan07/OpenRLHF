@@ -75,6 +75,16 @@ def train(args):
             # Ensure the internal async tasks are started
             ray.get(controller.start.remote())
 
+            # If curriculum args are provided, load challenges into the controller now
+            challenges_dir  = getattr(args, "challenges_dir", None)
+            if not challenges_dir:
+                raise ValueError("If starting a curriculum controller, you must specify a challenge dir.")
+            ray.get(
+                controller.load_challenges_from_dir.remote(
+                    challenges_dir,
+                )
+            )
+
     # configure strategy
     strategy = get_strategy(args)
     strategy.print(args)
