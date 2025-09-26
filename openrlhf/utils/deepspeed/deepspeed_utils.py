@@ -51,6 +51,9 @@ def get_train_ds_config(
         "data_types": {"grad_accum_dtype": grad_accum_dtype},
         "checkpoint": {
             "load_universal": use_ds_universal_ckpt,
+            # Ensure checkpoints are saved in universal format when enabled,
+            # so later loads look for `latest_universal` correctly.
+            "save_universal": use_ds_universal_ckpt,
         },
         "compile": {
             "deepcompile": deepcompile,

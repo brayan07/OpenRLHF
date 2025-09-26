@@ -6,24 +6,15 @@ from ray.util.placement_group import placement_group
 # Optional imports for arc-agi curriculum controller integration. These are
 # guarded so OpenRLHF can run without arc-agi installed unless the feature is
 # explicitly enabled via CLI flags.
-try:  # noqa: E402
-    from arc_agi.ui.services.curriculum_service import (  # type: ignore
-        DEFAULT_DB_FILE as ARC_AGI_DEFAULT_DB_FILE,
-    )
-except Exception:  # pragma: no cover
-    ARC_AGI_DEFAULT_DB_FILE = None  # type: ignore
-try:  # noqa: E402
-    from arc_agi.agent_based_rl.agent_executor import (  # type: ignore
-        CURRICULUM_CONTROLLER_NAME as ARC_AGI_DEFAULT_CONTROLLER_NAME,
-    )
-except Exception:  # pragma: no cover
-    ARC_AGI_DEFAULT_CONTROLLER_NAME = "curriculum_controller"  # fallback
-try:  # noqa: E402
-    from arc_agi.agent_based_rl.curriculum.curriculum_controller_actor import (  # type: ignore
-        CurriculumControllerActor as ArcAgiCurriculumControllerActor,
-    )
-except Exception:  # pragma: no cover
-    ArcAgiCurriculumControllerActor = None  # type: ignore
+from arc_agi.ui.services.curriculum_service import (  # type: ignore
+    DEFAULT_DB_FILE as ARC_AGI_DEFAULT_DB_FILE,
+)
+from arc_agi.agent_based_rl.agent_executor import (  # type: ignore
+    CURRICULUM_CONTROLLER_NAME as ARC_AGI_DEFAULT_CONTROLLER_NAME,
+)
+from arc_agi.agent_based_rl.curriculum.curriculum_controller_actor import (  # type: ignore
+    CurriculumControllerActor as ArcAgiCurriculumControllerActor,
+)
 
 from openrlhf.trainer.ray import create_vllm_engines
 from openrlhf.trainer.ray.launcher import (
@@ -69,14 +60,14 @@ def train(args):
             ControllerRemote = ray.remote(ArcAgiCurriculumControllerActor)
             controller = (
                 ControllerRemote.options(
-                    name=controller_name, lifetime="detached", scheduling_strategy="DEFAULT"
+                    name=controller_name, lifetime="detached", scheduling_strategy="DEFAULT", num_cpus=0.5
                 ).remote(storage_db_file=db_file, run_distributed=True)
             )
             # Ensure the internal async tasks are started
             ray.get(controller.start.remote())
 
             # If curriculum args are provided, load challenges into the controller now
-            challenges_dir  = getattr(args, "challenges_dir", None)
+            challenges_dir = getattr(args, "challenges_dir", None)
             if not challenges_dir:
                 raise ValueError("If starting a curriculum controller, you must specify a challenge dir.")
             ray.get(

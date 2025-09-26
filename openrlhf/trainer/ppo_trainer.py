@@ -214,12 +214,36 @@ class BasePPOTrainer(ABC):
         # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
         if global_step % args.save_steps == 0:
             tag = f"global_step{global_step}"
-            ref = self.actor_model_group.async_run_method(
+            # If colocated with vLLM and sleep mode is enabled, ensure vLLM engines are asleep
+            if self.vllm_engines is not None and getattr(self.args, "vllm_enable_sleep", False):
+                from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
+
+                batch_vllm_engine_call(self.vllm_engines, "sleep")
+
+
+            # Sequentially handle each model group to avoid simultaneous reloads
+            # 1) Actor: reload -> save -> offload
+            if getattr(self.strategy.args, "deepspeed_enable_sleep", False):
+                ray.get(self.actor_model_group.async_run_method(method_name="reload_states"))
+
+            actor_refs = self.actor_model_group.async_run_method(
                 method_name="save_checkpoint", tag=tag, client_states=client_states
             )
+            ray.get(actor_refs)
+
+            if getattr(self.strategy.args, "deepspeed_enable_sleep", False):
+                ray.get(self.actor_model_group.async_run_method(method_name="offload_states"))
+
+            # 2) Critic (if present): reload -> save -> offload
             if self.critic_model_group is not None:
-                ref.extend(self.critic_model_group.async_run_method(method_name="save_checkpoint", tag=tag))
-            ray.get(ref)
+                if getattr(self.strategy.args, "deepspeed_enable_sleep", False):
+                    ray.get(self.critic_model_group.async_run_method(method_name="reload_states"))
+
+                critic_refs = self.critic_model_group.async_run_method(method_name="save_checkpoint", tag=tag)
+                ray.get(critic_refs)
+
+                if getattr(self.strategy.args, "deepspeed_enable_sleep", False):
+                    ray.get(self.critic_model_group.async_run_method(method_name="offload_states"))
 
     def evaluate(self, eval_dataloader, global_step, temperature=0.6, n_samples_per_prompt=1):
         """Evaluate model performance on eval dataset.
@@ -340,11 +364,7 @@ class BasePPOTrainer(ABC):
             controller_name = getattr(args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME)
 
             # Determine how many items to request per pull to satisfy static batch sizes
-            target_item_count = max(
-                args.rollout_batch_size,
-                args.vllm_generate_batch_size if args.vllm_generate_batch_size is not None else args.rollout_batch_size,
-                args.train_batch_size,
-            )
+            target_item_count = args.vllm_generate_batch_size if args.vllm_generate_batch_size is not None else args.rollout_batch_size
 
             # Build train/eval iterables
             prompts_dataloader = ArcAgiCurriculumIterable(controller_name, target_item_count, mode="train")
@@ -352,9 +372,10 @@ class BasePPOTrainer(ABC):
 
             # Ask controller for a curriculum-based max_steps estimate
             controller = ray.get_actor(controller_name)
-            self.max_steps = ray.get(
-                controller.estimate_max_steps.remote(args.rollout_batch_size, args.max_train_episodes_per_challenge)
+            max_prompts = ray.get(
+                controller.get_max_prompts.remote()
             )
+            self.max_steps = max_prompts // (args.vllm_generate_batch_size if args.vllm_generate_batch_size is not None else args.rollout_batch_size)
 
             self.prompts_dataloader = prompts_dataloader
             self.eval_dataloader = eval_dataloader
@@ -507,7 +528,7 @@ class PPOTrainer(BasePPOTrainer):
             logger.info(f"checkpoint_states: {checkpoint_states}")
             self._broadcast_to_vllm()
         else:
-            checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}}
+            checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}, "controller_state": {}}
 
         # If specified eval before training, evaluate
         if getattr(args, "eval_upon_start", None):
@@ -522,6 +543,7 @@ class PPOTrainer(BasePPOTrainer):
 
         # If using arc-agi controller, restore controller state as well
         if controller_state and getattr(args, "agent_func_path", None):
+            print("Restoring curriculum controller state....")
             controller_name = getattr(self.args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME)
             controller = ray.get_actor(controller_name)
             # load is async; wait for completion to ensure deterministic continuation
@@ -559,6 +581,8 @@ class PPOTrainer(BasePPOTrainer):
                 if use_curriculum and controller is not None and batch_size_for_loader:
                     remaining_prompts = ray.get(controller.get_remaining_train_prompts.remote())
                     remaining_batches = max(0, remaining_prompts // int(batch_size_for_loader))
+                    print(f"Remaining prompts: {remaining_prompts}")
+                    print(f"Remaining steps: {remaining_batches}")
                     new_total = pbar.n + remaining_batches
                     if pbar.total != new_total:
                         pbar.total = new_total
@@ -653,6 +677,14 @@ class PPOTrainer(BasePPOTrainer):
                 # Add generated samples to status dictionary
                 if self.args.dynamic_filtering:
                     status["dynamic_filtering_pass_rate"] = pass_rate
+
+                # When using ARC-AGI curriculum controller, also log curriculum progress metrics
+                if use_curriculum and controller is not None:
+                    num_seen = ray.get(controller.get_num_challenges_seen.remote())
+                    num_solved = ray.get(controller.get_num_challenges_solved.remote())
+                    status["num_challenges_seen"] = int(num_seen)
+                    status["num_challenges_solved"] = int(num_solved)
+
                 logger.info(f"✨ Global step {steps}: {status}")
                 status["generated_samples"] = logging_samples
 
@@ -663,10 +695,13 @@ class PPOTrainer(BasePPOTrainer):
                 }
                 # Include controller checkpoint state if running with arc-agi dynamic curriculum
                 if getattr(self.args, "agent_func_path", None):
+                    print("Saving curriculum controller state....")
                     controller_name = getattr(self.args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME)
                     controller = ray.get_actor(controller_name)
                     client_states["controller_state"] = ray.get(controller.save_curriculum_checkpoint.remote())
+                    client_states["data_loader_state_dict"] = {}
                 else:
+                    client_states["controller_state"] = {}
                     client_states["data_loader_state_dict"] = self.prompts_dataloader.state_dict()
                 self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
 
