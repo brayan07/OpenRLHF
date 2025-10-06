@@ -6,15 +6,18 @@ from ray.util.placement_group import placement_group
 # Optional imports for arc-agi curriculum controller integration. These are
 # guarded so OpenRLHF can run without arc-agi installed unless the feature is
 # explicitly enabled via CLI flags.
-from arc_agi.agent_based_rl.agent_executor import (  # type: ignore
-    CURRICULUM_CONTROLLER_NAME as ARC_AGI_DEFAULT_CONTROLLER_NAME,
-)
 from arc_agi.agent_based_rl.curriculum.curriculum_controller_actor import (  # type: ignore
     CurriculumControllerActor as ArcAgiCurriculumControllerActor,
 )
 from arc_agi.agent_based_rl.curriculum.submission_actor import (  # type: ignore
     SubmissionActor as ArcAgiSubmissionActor,
+)
+from arc_agi.agent_based_rl.settings import (
+    CURRICULUM_CONTROLLER_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_CONTROLLER_NAME,
+    STORAGE_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_STORAGE_NAME,
     SUBMISSION_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_SUBMISSION_NAME,
+    CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS as ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS,
+    SUBMISSION_ACTOR_NUM_CPUS as ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS,
 )
 
 from openrlhf.trainer.ray import create_vllm_engines
@@ -35,87 +38,10 @@ def train(args):
 
     # Optionally start a detached arc-agi CurriculumController actor so that
     # AgentExecutor in arc-agi can resolve it via ray.get_actor(name).
-    if getattr(args, "start_curriculum_controller", False):
-        controller_name = (
-            args.curriculum_controller_name
-            if getattr(args, "curriculum_controller_name", None)
-            else ARC_AGI_DEFAULT_CONTROLLER_NAME
-        )
-        # If already exists, skip creation.
-        try:
-            ray.get_actor(controller_name)
-        except ValueError:
-            # Need arc-agi installed to start the controller
-            if ArcAgiCurriculumControllerActor is None:
-                raise RuntimeError(
-                    "arc-agi is required to start CurriculumController. Install arc-agi or disable --start_curriculum_controller."
-                )
-            storage_db_file = getattr(args, "storage_db_file", None)
-            if not storage_db_file:
-                raise RuntimeError("--storage_db_file is required when starting the curriculum controller.")
-            storage_actor_name = getattr(args, "storage_actor_name", None)
-            # Create detached controller actor and start its async loop
-            ControllerRemote = ray.remote(ArcAgiCurriculumControllerActor)
-            controller = (
-                ControllerRemote.options(
-                    name=controller_name, lifetime="detached", scheduling_strategy="DEFAULT", num_cpus=0.5
-                ).remote(storage_db_file=storage_db_file, run_distributed=True, storage_actor_name=storage_actor_name)
-            )
-            # Ensure the internal async tasks are started
-            ray.get(controller.start.remote())
-
-            # If curriculum args are provided, load challenges into the controller now
-            challenges_dir = getattr(args, "challenges_dir", None)
-            if not challenges_dir:
-                raise ValueError("If starting a curriculum controller, you must specify a challenge dir.")
-            ray.get(
-                controller.load_challenges_from_dir.remote(
-                    challenges_dir,
-                )
-            )
+    get_or_create_curriculum_controller(args)
 
     # Optionally start a detached arc-agi SubmissionActor to periodically write submission.json
-    if getattr(args, "start_submission_actor", False):
-        submission_name = (
-            args.submission_actor_name
-            if getattr(args, "submission_actor_name", None)
-            else ARC_AGI_DEFAULT_SUBMISSION_NAME
-        )
-        # If already exists, skip creation
-        try:
-            ray.get_actor(submission_name)
-        except ValueError:
-            if ArcAgiSubmissionActor is None:
-                raise RuntimeError(
-                    "arc-agi is required to start SubmissionActor. Install arc-agi or disable --start_submission_actor."
-                )
-            storage_db_file = getattr(args, "storage_db_file", None)
-            if not storage_db_file:
-                raise RuntimeError("--storage_db_file is required when starting the submission actor.")
-            submission_dir = args.submission_dir
-            if not submission_dir:
-                raise ValueError("--submission_dir is required when --start_submission_actor is set")
-            challenges_dir = getattr(args, "challenges_dir", None)
-            if not challenges_dir:
-                raise ValueError(
-                    "If starting a submission actor, you must specify --challenges_dir to preload the curriculum."
-                )
-            update_every = getattr(args, "submission_update_every_s", 30.0)
-            storage_actor_name = getattr(args, "storage_actor_name", None)
-            SubmissionRemote = ray.remote(ArcAgiSubmissionActor)
-            submission_actor = (
-                SubmissionRemote.options(
-                    name=submission_name, lifetime="detached", scheduling_strategy="DEFAULT", num_cpus=0.25
-                ).remote(
-                    storage_db_file=storage_db_file,
-                    submission_dir=submission_dir,
-                    challenges_dir=challenges_dir,
-                    run_distributed=True,
-                    update_interval_sec=update_every,
-                    storage_actor_name=storage_actor_name,
-                )
-            )
-            ray.get(submission_actor.start.remote())
+    get_or_create_submission_actor(args)
 
     # configure strategy
     strategy = get_strategy(args)
@@ -289,6 +215,97 @@ def train(args):
         ray.get(critic_model.async_save_model())
 
 
+def get_or_create_submission_actor(args):
+    if getattr(args, "start_submission_actor", False):
+        # If already exists, skip creation
+        try:
+            ray.get_actor(ARC_AGI_DEFAULT_SUBMISSION_NAME)
+        except ValueError:
+            if ArcAgiSubmissionActor is None:
+                raise RuntimeError(
+                    "arc-agi is required to start SubmissionActor. Install arc-agi or disable --start_submission_actor."
+                )
+            storage_db_file = getattr(args, "storage_db_file", None)
+            if not storage_db_file:
+                raise RuntimeError("--storage_db_file is required when starting the submission actor.")
+            submission_dir = args.submission_dir
+            if not submission_dir:
+                raise ValueError("--submission_dir is required when --start_submission_actor is set")
+            challenges_dir = getattr(args, "challenges_dir", None)
+            if not challenges_dir:
+                raise ValueError(
+                    "If starting a submission actor, you must specify --challenges_dir to preload the curriculum."
+                )
+            update_every = getattr(args, "submission_update_every_s", 30.0)
+
+            # Create submission actor
+            SubmissionRemote = ray.remote(ArcAgiSubmissionActor)
+            submission_kwargs = {
+                "name": ARC_AGI_DEFAULT_SUBMISSION_NAME,
+                "lifetime": "detached",
+                "scheduling_strategy": "DEFAULT",
+            }
+            if ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS is not None:
+                submission_kwargs["num_cpus"] = ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS
+            submission_actor = (
+                SubmissionRemote.options(**submission_kwargs).remote(
+                    storage_db_file=storage_db_file,
+                    submission_dir=submission_dir,
+                    challenges_dir=challenges_dir,
+                    run_distributed=True,
+                    update_interval_sec=update_every,
+                    storage_actor_name=ARC_AGI_DEFAULT_STORAGE_NAME,
+                )
+            )
+            ray.get(submission_actor.start.remote())
+
+
+def get_or_create_curriculum_controller(args):
+    if getattr(args, "start_curriculum_controller", False):
+        # If already exists, skip creation.
+        try:
+            ray.get_actor(ARC_AGI_DEFAULT_CONTROLLER_NAME)
+        except ValueError:
+            # Need arc-agi installed to start the controller
+            if ArcAgiCurriculumControllerActor is None:
+                raise RuntimeError(
+                    "arc-agi is required to start CurriculumController. Install arc-agi or disable --start_curriculum_controller."
+                )
+            storage_db_file = getattr(args, "storage_db_file", None)
+            if not storage_db_file:
+                raise RuntimeError("--storage_db_file is required when starting the curriculum controller.")
+
+            # Create detached controller actor and start its async loop
+            ControllerRemote = ray.remote(ArcAgiCurriculumControllerActor)
+            controller_kwargs = {
+                "name": ARC_AGI_DEFAULT_CONTROLLER_NAME,
+                "lifetime": "detached",
+                "scheduling_strategy": "DEFAULT",
+            }
+            if ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS is not None:
+                controller_kwargs["num_cpus"] = ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS
+            controller = (
+                ControllerRemote.options(**controller_kwargs).remote(
+                    storage_db_file=storage_db_file,
+                    run_distributed=True,
+                    storage_actor_name=ARC_AGI_DEFAULT_STORAGE_NAME
+                )
+            )
+
+            # Ensure the internal async tasks are started
+            ray.get(controller.start.remote())
+
+            # If curriculum args are provided, load challenges into the controller now
+            challenges_dir = getattr(args, "challenges_dir", None)
+            if not challenges_dir:
+                raise ValueError("If starting a curriculum controller, you must specify a challenge dir.")
+            ray.get(
+                controller.load_challenges_from_dir.remote(
+                    challenges_dir,
+                )
+            )
+
+
 def get_parser():
     parser = argparse.ArgumentParser()
     # Ray and vLLM
@@ -362,27 +379,13 @@ def get_parser():
         default=False,
         help="Start an arc-agi CurriculumController as a detached Ray actor before training.",
     )
-    parser.add_argument(
-        "--curriculum_controller_name",
-        type=str,
-        default=None,
-        help=(
-            "Ray actor name for the curriculum controller. If not provided and "
-            "--start_curriculum_controller is set, a default will be used."
-        ),
-    )
-    # Unified storage configuration
+
+    # Arc-AGI Unified storage configuration
     parser.add_argument(
         "--storage_db_file",
         type=str,
         help="Path to the SQLite DB file used by the shared StorageActor (required when starting curriculum/submission actors).",
         default=None,
-    )
-    parser.add_argument(
-        "--storage_actor_name",
-        type=str,
-        default=None,
-        help="Ray actor name for the shared StorageActor. If not provided, arc-agi's default will be used.",
     )
     parser.add_argument(
         "--challenges_dir",
@@ -400,15 +403,6 @@ def get_parser():
         action="store_true",
         default=False,
         help="Start an arc-agi SubmissionActor as a detached Ray actor before training.",
-    )
-    parser.add_argument(
-        "--submission_actor_name",
-        type=str,
-        default=None,
-        help=(
-            "Ray actor name for the submission actor. If not provided and "
-            "--start_submission_actor is set, a default will be used."
-        ),
     )
     parser.add_argument(
         "--submission_dir",
