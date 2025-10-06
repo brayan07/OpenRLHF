@@ -9,6 +9,8 @@ import ray
 import torch
 from tqdm import tqdm
 
+ARC_AGI_EVALUATION_MODE = "inference"
+
 try:
     # Late import so OpenRLHF remains usable without arc-agi installed
     from arc_agi.agent_based_rl.curriculum.iterable_dataset import (
@@ -271,7 +273,7 @@ class BasePPOTrainer(ABC):
             )
             controller_actor = ray.get_actor(controller_name)
             # strict=True to ensure barrier before proceeding
-            ray.get(controller_actor.set_mode.remote("inference", True))
+            ray.get(controller_actor.set_mode.remote(ARC_AGI_EVALUATION_MODE, True))
 
         with torch.no_grad():
             # First collect all prompts and labels
@@ -411,7 +413,7 @@ class BasePPOTrainer(ABC):
 
         # Build train/eval iterables
         prompts_dataloader = ArcAgiCurriculumIterable(ARC_AGI_DEFAULT_CONTROLLER_NAME, target_item_count, mode="train")
-        eval_dataloader = ArcAgiCurriculumIterable(ARC_AGI_DEFAULT_CONTROLLER_NAME, 1, mode="eval")
+        eval_dataloader = ArcAgiCurriculumIterable(ARC_AGI_DEFAULT_CONTROLLER_NAME, 1, mode=ARC_AGI_EVALUATION_MODE)
 
         # Ask controller for a curriculum-based max_steps estimate
         controller = ray.get_actor(ARC_AGI_DEFAULT_CONTROLLER_NAME)
