@@ -551,6 +551,7 @@ class PPOTrainer(BasePPOTrainer):
                 range(self.prompts_dataloader.__len__()),
                 desc=f"Episode [{episode + 1}/{args.num_episodes}]",
                 disable=False,
+                initial=steps,
             )
             # Curriculum-aware dynamic pbar total: set up controller and batch size if in curriculum mode
             use_curriculum = getattr(self.args, "start_curriculum_controller", None) is not None
