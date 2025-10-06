@@ -617,9 +617,9 @@ class PPOTrainer(BasePPOTrainer):
                 # Select 3 samples to log
                 logging_samples = [[
                     self.tokenizer.batch_decode(
-                        experiences[i].sequences[0].unsqueeze(0), skip_special_tokens=False
+                        experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=False
                     ),
-                    experiences[i].info["reward"][0]
+                    experiences[0].info["reward"][0]
                 ]]
 
                 # balance experiences across dp
