@@ -16,7 +16,7 @@ from arc_agi.agent_based_rl.settings import (
     CURRICULUM_CONTROLLER_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_CONTROLLER_NAME,
     STORAGE_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_STORAGE_NAME,
     SUBMISSION_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_SUBMISSION_NAME,
-    CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS as ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS,
+    CURRICULUM_CONTROLLER_ACTOR_RESERVED_CPUS as ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS,
     SUBMISSION_ACTOR_NUM_CPUS as ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS,
 )
 
@@ -238,6 +238,7 @@ def get_or_create_submission_actor(args):
                 )
             update_every = getattr(args, "submission_update_every_s", 30.0)
 
+
             # Create submission actor
             SubmissionRemote = ray.remote(ArcAgiSubmissionActor)
             submission_kwargs = {
@@ -258,6 +259,15 @@ def get_or_create_submission_actor(args):
                 )
             )
             ray.get(submission_actor.start.remote())
+
+            # If submission filed added, load solutions into the actor now
+            submission_solution_file = getattr(args, "submission_solution_file", None)
+            if submission_solution_file:
+                ray.get(
+                    submission_actor.load_solution_file.remote(
+                        submission_solution_file,
+                    )
+                )
 
 
 def get_or_create_curriculum_controller(args):
@@ -409,6 +419,12 @@ def get_parser():
         type=str,
         default=None,
         help="Directory where submission.json will be written by the SubmissionActor.",
+    )
+    parser.add_argument(
+        "--submission_solution_file",
+        type=str,
+        default=None,
+        help="Optional file with solutions for performance reporting.",
     )
     parser.add_argument(
         "--submission_update_every_s",
@@ -670,9 +686,6 @@ if __name__ == "__main__":
 
     if args.agent_func_path:
         args.remote_rm_url = "agent"
-        # If user wants the curriculum controller, ensure the name is consistent
-        if args.start_curriculum_controller and not args.curriculum_controller_name:
-            args.curriculum_controller_name = ARC_AGI_DEFAULT_CONTROLLER_NAME
 
     if args.advantage_estimator not in ["gae"]:
         args.critic_pretrain = None
