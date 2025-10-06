@@ -245,7 +245,7 @@ def get_or_create_submission_actor(args):
                 "lifetime": "detached",
                 "scheduling_strategy": "DEFAULT",
             }
-            if ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS is not None:
+            if ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS:
                 submission_kwargs["num_cpus"] = ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS
             submission_actor = (
                 SubmissionRemote.options(**submission_kwargs).remote(
@@ -282,7 +282,7 @@ def get_or_create_curriculum_controller(args):
                 "lifetime": "detached",
                 "scheduling_strategy": "DEFAULT",
             }
-            if ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS is not None:
+            if ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS:
                 controller_kwargs["num_cpus"] = ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS
             controller = (
                 ControllerRemote.options(**controller_kwargs).remote(
