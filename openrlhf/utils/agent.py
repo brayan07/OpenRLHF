@@ -7,7 +7,7 @@ from vllm.inputs import TokensPrompt
 
 class AgentInstanceBase(ABC):
     @abstractmethod
-    async def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         pass
 
     async def reset(self, states: dict, **kwargs):
