@@ -268,11 +268,13 @@ class BasePPOTrainer(ABC):
         # If using arc-agi AgentExecutor, temporarily switch curriculum controller to 'eval' mode
         controller_actor = None
         if getattr(self.args, "start_curriculum_controller", None):
+            logger.info("Using arc-agi curriculum controller iterable for evaluation.")
             controller_name = getattr(
                 self.args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME
             )
             controller_actor = ray.get_actor(controller_name)
             # strict=True to ensure barrier before proceeding
+            logger.info(f"Setting arc-agi curriculum controller to {ARC_AGI_EVALUATION_MODE} mode.")
             ray.get(controller_actor.set_mode.remote(ARC_AGI_EVALUATION_MODE, True))
 
         with torch.no_grad():
@@ -347,6 +349,7 @@ class BasePPOTrainer(ABC):
 
         # Switch controller back to 'train' mode if we changed it
         if controller_actor is not None:
+            logger.info(f"Switching arc-agi curriculum controller to train mode.")
             ray.get(controller_actor.set_mode.remote("train", True))
 
         end_time = time.time()
