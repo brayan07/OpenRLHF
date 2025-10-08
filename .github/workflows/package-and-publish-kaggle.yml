@@ -1,0 +1,149 @@
+name: Package and Publish to Kaggle (OpenRLHF)
+
+on:
+  push:
+    branches:
+      - develop
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "**/.gitignore"
+      - ".github/**"
+
+permissions:
+  contents: read
+
+jobs:
+  pack-and-publish:
+    runs-on: ubuntu-latest
+    env:
+      ARCHIVE_NAME: openrlhf-fork-codebase.tar.gz
+      DATASET_TITLE: OpenRLHF Fork Codebase
+      DATASET_SLUG: openrlhf-fork-codebase
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Kaggle CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install kaggle
+
+      - name: Configure Kaggle credentials
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          if [ -z "$KAGGLE_USERNAME" ] || [ -z "$KAGGLE_KEY" ]; then
+            echo "KAGGLE_USERNAME and KAGGLE_KEY secrets are required." >&2
+            exit 1
+          fi
+          mkdir -p ~/.kaggle
+          printf '{"username":"%s","key":"%s"}' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Create code archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT_DIR="$PWD"
+          TMP_DIR=$(mktemp -d)
+          echo "Using temp dir: $TMP_DIR"
+
+          # Copy repo to temp to avoid packaging git metadata, then prune
+          rsync -a --delete --exclude='.git' . "$TMP_DIR/repo/"
+          cd "$TMP_DIR/repo"
+
+          # Exclude common non-essential paths
+          tar \
+            --exclude='./.git' \
+            --exclude='./data' \
+            --exclude='**/__pycache__' \
+            --exclude='**/node_modules' \
+            --exclude='./tmp' \
+            --exclude='*.tar.gz' \
+            --exclude='./.idea' \
+            --exclude='*.egg-info' \
+            --exclude='./.pytest_cache' \
+            --exclude='./.ruff_cache' \
+            -czf "$ROOT_DIR/${{ env.ARCHIVE_NAME }}" .
+
+          cd "$ROOT_DIR"
+          echo "Archive created: $ROOT_DIR/${{ env.ARCHIVE_NAME }}"
+
+      - name: Prepare Kaggle dataset folder
+        run: |
+          mkdir -p kaggle_dataset
+          mv "${{ env.ARCHIVE_NAME }}" kaggle_dataset/
+
+      - name: Create dataset-metadata.json dynamically
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        run: |
+          if [ -z "$KAGGLE_USERNAME" ]; then
+            echo "KAGGLE_USERNAME secret is required to construct dataset id." >&2
+            exit 1
+          fi
+          SHORT_SHA="${GITHUB_SHA::7}"
+          SUBTITLE="Automated codebase archive from ${GITHUB_REPOSITORY}@${SHORT_SHA}"
+          if [ ${#SUBTITLE} -lt 20 ]; then
+            SUBTITLE="OpenRLHF codebase archive ${SHORT_SHA}"
+          fi
+          cat > kaggle_dataset/dataset-metadata.json <<EOF
+          {
+            "title": "${{ env.DATASET_TITLE }}",
+            "id": "${KAGGLE_USERNAME}/${{ env.DATASET_SLUG }}",
+            "licenses": [
+              { "name": "Apache-2.0" }
+            ],
+            "isPrivate": true,
+            "subtitle": "${SUBTITLE}",
+            "description": "Automated upload from CI. Contains a tar.gz of the repository with non-essential directories excluded."
+          }
+          EOF
+          echo "Generated kaggle_dataset/dataset-metadata.json"
+
+      - name: Create or version Kaggle dataset
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from datetime import datetime
+          from kaggle.api.kaggle_api_extended import KaggleApi
+
+          ds_dir = 'kaggle_dataset'
+          metadata_path = os.path.join(ds_dir, 'dataset-metadata.json')
+          with open(metadata_path, 'r') as f:
+            meta = json.load(f)
+          ds_id = meta['id']
+
+          api = KaggleApi()
+          api.authenticate()
+
+          # Check if dataset exists
+          response = api.dataset_list(mine=True)
+          my_datasets = [r.ref for r in response]
+          exists = ds_id in my_datasets
+
+          notes = f"Automated update {datetime.utcnow().isoformat()} UTC (commit {os.environ.get('GITHUB_SHA','')[:7]})"
+
+          if exists:
+            print(f"Dataset {ds_id} exists. Creating a new version...")
+            api.dataset_create_version(ds_dir, notes, convert_to_csv=False, dir_mode='zip', delete_old_versions=True)
+          else:
+            print(f"Dataset {ds_id} not found. Creating it...")
+            api.dataset_create_new(ds_dir, convert_to_csv=False, dir_mode='zip')
+
+          print("Done.")
+          PY
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "Packaged and published ${{ env.ARCHIVE_NAME }} to Kaggle dataset '${{ env.DATASET_TITLE }}' (slug: ${{ env.DATASET_SLUG }})."
