@@ -510,11 +510,14 @@ class PPOTrainer(BasePPOTrainer):
         # Initialize async disk logger if enabled
         self._exp_logger = None
         try:
-            if getattr(self.args, "log_experience_dir", None):
+            if getattr(self.args, "log_experience_dir", None) and getattr(self.args, "log_experience_every", -1) > 0:
+                logger.info(f"Log experience to {self.args.log_experience_dir} every {self.args.log_experience_every} steps")
                 self._exp_logger = ExperienceDiskLogger.remote(
                     self.args.log_experience_dir, getattr(self.args, "log_experience_jsonl", False)
                 )
                 self._log_every = max(1, int(getattr(self.args, "log_experience_every", 1)))
+            else:
+                logger.warning("Experience logging is disabled.")
         except Exception as e:
             logger.warning(f"Failed to initialize ExperienceDiskLogger: {e}")
 
