@@ -1,0 +1,65 @@
+ARG BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
+FROM ${BASE_IMAGE} AS app
+
+# Make sure python3.10-venv is installed
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes python3.10-venv tmux git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create a new user with the same UID and GID as the host
+ARG USER_ID
+ARG GROUP_ID
+ARG USERNAME
+RUN if ! getent group $GROUP_ID; then groupadd -g $GROUP_ID $USERNAME; fi && \
+    if ! id -u $USER_ID > /dev/null 2>&1; then useradd -u $USER_ID -g $GROUP_ID -m -s /bin/bash $USERNAME; fi && \
+    echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the current directory contents into the container at /app
+COPY . /app
+
+# Change ownership of the /app directory to the new user
+RUN chown -R $USERNAME:$GROUP_ID /app
+
+# Switch to the new user
+USER $USERNAME
+
+# Create and activate a new Python virtual environment
+RUN python3 -m venv ~/venv && \
+    . ~/venv/bin/activate
+
+# Ensure the venv bin is on PATH for all processes
+ENV PATH="/home/$USERNAME/venv/bin:${PATH}"
+
+# Add an entrypoint wrapper that auto-activates the venv and then execs the given command
+# Install it from the already-copied project tree to avoid host path differences across build contexts
+USER root
+RUN install -m 0755 /app/dockerfile/with-venv.sh /usr/local/bin/with-venv
+USER $USERNAME
+
+# Optional extras to install from setup.py, e.g., OPENRLHF_EXTRAS="vllm,ring,liger"
+ARG OPENRLHF_EXTRAS=""
+
+# Install and upgrade setuptools and setuptools-scm
+RUN ~/venv/bin/pip install --no-cache-dir --upgrade setuptools setuptools-scm
+
+# Install pip-tools
+RUN ~/venv/bin/pip install --no-cache-dir pip-tools
+
+# Install dependencies from requirements.txt
+RUN ~/venv/bin/pip install --no-cache-dir --prefer-binary torch==2.7.1 # Required for build of flash-attention
+RUN ~/venv/bin/pip install --no-cache-dir --prefer-binary -r requirements.txt
+RUN ~/venv/bin/pip install --no-cache-dir --prefer-binary -r requirements-dev.txt
+
+# Install the local package in the virtual environment
+RUN if [ -n "$OPENRLHF_EXTRAS" ]; then \
+        ~/venv/bin/pip install --no-cache-dir --prefer-binary -e ".[${OPENRLHF_EXTRAS}]" ; \
+    else \
+        ~/venv/bin/pip install --no-cache-dir --prefer-binary -e . ; \
+    fi
+
+# Set the default command
+ENTRYPOINT ["/usr/local/bin/with-venv"]
+CMD ["bash"]

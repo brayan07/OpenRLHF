@@ -3,6 +3,22 @@ from datetime import datetime
 
 import ray
 from ray.util.placement_group import placement_group
+# Optional imports for arc-agi curriculum controller integration. These are
+# guarded so OpenRLHF can run without arc-agi installed unless the feature is
+# explicitly enabled via CLI flags.
+from arc_agi.agent_based_rl.curriculum.curriculum_controller_actor import (  # type: ignore
+    CurriculumControllerActor as ArcAgiCurriculumControllerActor,
+)
+from arc_agi.agent_based_rl.curriculum.submission_actor import (  # type: ignore
+    SubmissionActor as ArcAgiSubmissionActor,
+)
+from arc_agi.agent_based_rl.settings import (
+    CURRICULUM_CONTROLLER_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_CONTROLLER_NAME,
+    STORAGE_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_STORAGE_NAME,
+    SUBMISSION_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_SUBMISSION_NAME,
+    CURRICULUM_CONTROLLER_ACTOR_RESERVED_CPUS as ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS,
+    SUBMISSION_ACTOR_NUM_CPUS as ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS,
+)
 
 from openrlhf.trainer.ray import create_vllm_engines
 from openrlhf.trainer.ray.launcher import (
@@ -19,6 +35,13 @@ def train(args):
     # initialize ray if not initialized
     if not ray.is_initialized():
         ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}})
+
+    # Optionally start a detached arc-agi CurriculumController actor so that
+    # AgentExecutor in arc-agi can resolve it via ray.get_actor(name).
+    get_or_create_curriculum_controller(args)
+
+    # Optionally start a detached arc-agi SubmissionActor to periodically write submission.json
+    get_or_create_submission_actor(args)
 
     # configure strategy
     strategy = get_strategy(args)
@@ -79,7 +102,7 @@ def train(args):
         args.actor_num_gpus_per_node,
         PolicyModelActor,
         pg=pg,
-        num_gpus_per_actor=0.2 if pg else 1,
+        num_gpus_per_actor=0.5 if pg else 1,
         duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
     )
 
@@ -91,7 +114,7 @@ def train(args):
             args.ref_num_gpus_per_node,
             ReferenceModelActor,
             pg=pg,
-            num_gpus_per_actor=0.2 if pg else 1,
+            num_gpus_per_actor=0.5 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
 
@@ -115,7 +138,7 @@ def train(args):
             args.critic_num_gpus_per_node,
             CriticModelActor,
             pg=pg,
-            num_gpus_per_actor=0.2 if pg else 1,
+            num_gpus_per_actor=0.5 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
     else:
@@ -129,7 +152,7 @@ def train(args):
             args.reward_num_gpus_per_node,
             RewardModelActor,
             pg=pg,
-            num_gpus_per_actor=0.2 if pg else 1,
+            num_gpus_per_actor=0.5 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
     else:
@@ -162,6 +185,11 @@ def train(args):
     # training update steps
     max_steps = ray.get(ppo_trainer.get_max_steps.remote())
 
+    # Batch sleep engines
+    if args.vllm_enable_sleep:
+        from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
+        batch_vllm_engine_call(vllm_engines, "sleep")
+
     # init reference/reward/actor model
     refs = []
     if ref_model is not None:
@@ -187,7 +215,108 @@ def train(args):
         ray.get(critic_model.async_save_model())
 
 
-if __name__ == "__main__":
+def get_or_create_submission_actor(args):
+    if getattr(args, "start_submission_actor", False):
+        # If already exists, skip creation
+        try:
+            ray.get_actor(ARC_AGI_DEFAULT_SUBMISSION_NAME)
+        except ValueError:
+            if ArcAgiSubmissionActor is None:
+                raise RuntimeError(
+                    "arc-agi is required to start SubmissionActor. Install arc-agi or disable --start_submission_actor."
+                )
+            storage_db_file = getattr(args, "storage_db_file", None)
+            if not storage_db_file:
+                raise RuntimeError("--storage_db_file is required when starting the submission actor.")
+            submission_dir = args.submission_dir
+            if not submission_dir:
+                raise ValueError("--submission_dir is required when --start_submission_actor is set")
+            challenges_dir = getattr(args, "challenges_dir", None)
+            if not challenges_dir:
+                raise ValueError(
+                    "If starting a submission actor, you must specify --challenges_dir to preload the curriculum."
+                )
+            update_every = getattr(args, "submission_update_every_s", 30.0)
+
+
+            # Create submission actor
+            SubmissionRemote = ray.remote(ArcAgiSubmissionActor)
+            submission_kwargs = {
+                "name": ARC_AGI_DEFAULT_SUBMISSION_NAME,
+                "lifetime": "detached",
+                "scheduling_strategy": "DEFAULT",
+            }
+            if ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS:
+                submission_kwargs["num_cpus"] = ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS
+            submission_actor = (
+                SubmissionRemote.options(**submission_kwargs).remote(
+                    storage_db_file=storage_db_file,
+                    submission_dir=submission_dir,
+                    challenges_dir=challenges_dir,
+                    run_distributed=True,
+                    update_interval_sec=update_every,
+                    storage_actor_name=ARC_AGI_DEFAULT_STORAGE_NAME,
+                )
+            )
+            ray.get(submission_actor.start.remote())
+
+            # If submission filed added, load solutions into the actor now
+            submission_solution_file = getattr(args, "submission_solution_file", None)
+            if submission_solution_file:
+                ray.get(
+                    submission_actor.load_solution_file.remote(
+                        submission_solution_file,
+                    )
+                )
+
+
+def get_or_create_curriculum_controller(args):
+    if getattr(args, "start_curriculum_controller", False):
+        # If already exists, skip creation.
+        try:
+            ray.get_actor(ARC_AGI_DEFAULT_CONTROLLER_NAME)
+        except ValueError:
+            # Need arc-agi installed to start the controller
+            if ArcAgiCurriculumControllerActor is None:
+                raise RuntimeError(
+                    "arc-agi is required to start CurriculumController. Install arc-agi or disable --start_curriculum_controller."
+                )
+            storage_db_file = getattr(args, "storage_db_file", None)
+            if not storage_db_file:
+                raise RuntimeError("--storage_db_file is required when starting the curriculum controller.")
+
+            # Create detached controller actor and start its async loop
+            ControllerRemote = ray.remote(ArcAgiCurriculumControllerActor)
+            controller_kwargs = {
+                "name": ARC_AGI_DEFAULT_CONTROLLER_NAME,
+                "lifetime": "detached",
+                "scheduling_strategy": "DEFAULT",
+            }
+            if ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS:
+                controller_kwargs["num_cpus"] = ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS
+            controller = (
+                ControllerRemote.options(**controller_kwargs).remote(
+                    storage_db_file=storage_db_file,
+                    run_distributed=True,
+                    storage_actor_name=ARC_AGI_DEFAULT_STORAGE_NAME
+                )
+            )
+
+            # Ensure the internal async tasks are started
+            ray.get(controller.start.remote())
+
+            # If curriculum args are provided, load challenges into the controller now
+            challenges_dir = getattr(args, "challenges_dir", None)
+            if not challenges_dir:
+                raise ValueError("If starting a curriculum controller, you must specify a challenge dir.")
+            ray.get(
+                controller.load_challenges_from_dir.remote(
+                    challenges_dir,
+                )
+            )
+
+
+def get_parser():
     parser = argparse.ArgumentParser()
     # Ray and vLLM
     parser.add_argument("--ref_num_nodes", type=int, default=1, help="number of nodes for reference")
@@ -253,10 +382,65 @@ if __name__ == "__main__":
     # Async training using ray
     parser.add_argument("--async_train", action="store_true", default=False, help="Enable async training")
 
+    # Arc-AGI curriculum integration
+    parser.add_argument(
+        "--start_curriculum_controller",
+        action="store_true",
+        default=False,
+        help="Start an arc-agi CurriculumController as a detached Ray actor before training.",
+    )
+
+    # Arc-AGI Unified storage configuration
+    parser.add_argument(
+        "--storage_db_file",
+        type=str,
+        help="Path to the SQLite DB file used by the shared StorageActor (required when starting curriculum/submission actors).",
+        default=None,
+    )
+    parser.add_argument(
+        "--challenges_dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory containing ARC challenge JSON files. Required when --start_curriculum_controller is set; "
+            "used to preload the controller."
+        ),
+    )
+
+    # Arc-AGI submission actor integration
+    parser.add_argument(
+        "--start_submission_actor",
+        action="store_true",
+        default=False,
+        help="Start an arc-agi SubmissionActor as a detached Ray actor before training.",
+    )
+    parser.add_argument(
+        "--submission_dir",
+        type=str,
+        default=None,
+        help="Directory where submission.json will be written by the SubmissionActor.",
+    )
+    parser.add_argument(
+        "--submission_solution_file",
+        type=str,
+        default=None,
+        help="Optional file with solutions for performance reporting.",
+    )
+    parser.add_argument(
+        "--submission_update_every_s",
+        type=float,
+        default=30.0,
+        help="How often the SubmissionActor should update submission.json (in seconds).",
+    )
+
     # Checkpoints
     parser.add_argument("--eval_steps", type=int, default=-1)
     parser.add_argument("--save_steps", type=int, default=-1)
     parser.add_argument("--logging_steps", type=int, default=1)
+    # Experience logging knobs
+    parser.add_argument("--log_experience_dir", type=str, default=None, help="Directory to write rollouts/experiences dumps")
+    parser.add_argument("--log_experience_every", type=int, default=-1, help="Write dumps every N steps")
+    parser.add_argument("--log_experience_jsonl", action="store_true", default=False, help="Also write JSONL summaries")
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_ppo_ray")
     parser.add_argument("--save_hf_ckpt", action="store_true", default=False)
     parser.add_argument("--disable_ds_ckpt", action="store_true", default=False)
@@ -337,10 +521,30 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=1, help="PPO GAE gamma")
     parser.add_argument("--micro_train_batch_size", type=int, default=4, help="batch size per GPU")
     parser.add_argument("--train_batch_size", type=int, default=128, help="Global training batch size")
-    parser.add_argument("--normalize_reward", action="store_true", default=False, help="Enable Reward Normazation")
+    parser.add_argument("--normalize_reward", action="store_true", default=False, help="Enable Reward Normalization")
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
+    # Tokenization options
+    parser.add_argument(
+        "--pad_token_id",
+        type=int,
+        default=None,
+        help=(
+            "Custom pad token id to use. Will set tokenizer.pad_token_id and attempt to set "
+            "tokenizer.pad_token accordingly. If both --pad_token_id and --pad_token_string are set, "
+            "they must map to each other or an error will be raised."
+        ),
+    )
+    parser.add_argument(
+        "--pad_token_string",
+        type=str,
+        default=None,
+        help=(
+            "Custom pad token string to use. Must correspond to exactly one tokenizer id. If both "
+            "--pad_token_id and --pad_token_string are set, they must map to each other or an error will be raised."
+        ),
+    )
     parser.add_argument(
         "--full_determinism",
         action="store_true",
@@ -434,6 +638,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval_n_samples_per_prompt", type=int, default=4, help="Number of samples per prompt for evaluation"
     )
+    parser.add_argument("--eval_upon_start", action="store_true", default=False)
 
     parser.add_argument("--input_key", type=str, default="input", help="JSON dataset key")
     parser.add_argument("--label_key", type=str, default=None, help="JSON dataset key")
@@ -468,6 +673,11 @@ if __name__ == "__main__":
     # ModelScope parameters
     parser.add_argument("--use_ms", action="store_true", default=False)
 
+    return parser
+
+
+if __name__ == "__main__":
+    parser = get_parser()
     args = parser.parse_args()
 
     # Validate arguments
@@ -533,7 +743,7 @@ if __name__ == "__main__":
         assert not args.vllm_enable_sleep, "Async RLHF is not supported with --vllm_enable_sleep."
 
     if args.eval_dataset:
-        assert args.remote_rm_url, "`--eval_dataset` is only supported with `--remote_rm_url`."
+        assert args.remote_rm_url or args.agent_func_path, "`--eval_dataset` is only supported with `--remote_rm_url`. or `--agent_func_path`"
 
     if args.use_kl_loss:
         if args.kl_estimator not in ["k2", "k3"]:

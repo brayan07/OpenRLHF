@@ -1,11 +1,29 @@
 import os
 import time
+from copy import deepcopy
 from abc import ABC
 from datetime import timedelta
+from typing import Any
 
 import ray
 import torch
 from tqdm import tqdm
+
+ARC_AGI_EVALUATION_MODE = "inference"
+
+try:
+    # Late import so OpenRLHF remains usable without arc-agi installed
+    from arc_agi.agent_based_rl.curriculum.iterable_dataset import (
+        ArcAgiCurriculumIterable,
+    )  # type: ignore
+    from arc_agi.agent_based_rl.settings import (  # type: ignore
+        CURRICULUM_CONTROLLER_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_CONTROLLER_NAME,
+        SUBMISSION_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_SUBMISSION_NAME,
+    )
+except Exception:
+    raise RuntimeError(
+        "agent_func_path set but arc-agi curriculum iterable is unavailable. Ensure arc-agi is installed."
+    )
 
 from openrlhf.datasets import PromptDataset
 from openrlhf.datasets.utils import blending_datasets
@@ -16,6 +34,7 @@ from openrlhf.trainer.ray.launcher import RayActorGroup
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.utils import get_tokenizer
+from openrlhf.utils.experience_logger import ExperienceDiskLogger
 
 logger = init_logger(__name__)
 
@@ -174,7 +193,8 @@ class BasePPOTrainer(ABC):
                     new_table = self._wandb.Table(
                         columns=self.generated_samples_table.columns, data=self.generated_samples_table.data
                     )
-                    new_table.add_data(global_step, *logs_dict.pop("generated_samples"))
+                    for record in logs_dict["generated_samples"]:
+                        new_table.add_data(global_step, *record)
                     self.generated_samples_table = new_table
                     self._wandb.log({"train/generated_samples": new_table})
                 logs = {
@@ -203,12 +223,36 @@ class BasePPOTrainer(ABC):
         # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
         if global_step % args.save_steps == 0:
             tag = f"global_step{global_step}"
-            ref = self.actor_model_group.async_run_method(
+            # If colocated with vLLM and sleep mode is enabled, ensure vLLM engines are asleep
+            if self.vllm_engines is not None and getattr(self.args, "vllm_enable_sleep", False):
+                from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
+
+                batch_vllm_engine_call(self.vllm_engines, "sleep")
+
+
+            # Sequentially handle each model group to avoid simultaneous reloads
+            # 1) Actor: reload -> save -> offload
+            if getattr(self.strategy.args, "deepspeed_enable_sleep", False):
+                ray.get(self.actor_model_group.async_run_method(method_name="reload_states"))
+
+            actor_refs = self.actor_model_group.async_run_method(
                 method_name="save_checkpoint", tag=tag, client_states=client_states
             )
+            ray.get(actor_refs)
+
+            if getattr(self.strategy.args, "deepspeed_enable_sleep", False):
+                ray.get(self.actor_model_group.async_run_method(method_name="offload_states"))
+
+            # 2) Critic (if present): reload -> save -> offload
             if self.critic_model_group is not None:
-                ref.extend(self.critic_model_group.async_run_method(method_name="save_checkpoint", tag=tag))
-            ray.get(ref)
+                if getattr(self.strategy.args, "deepspeed_enable_sleep", False):
+                    ray.get(self.critic_model_group.async_run_method(method_name="reload_states"))
+
+                critic_refs = self.critic_model_group.async_run_method(method_name="save_checkpoint", tag=tag)
+                ray.get(critic_refs)
+
+                if getattr(self.strategy.args, "deepspeed_enable_sleep", False):
+                    ray.get(self.critic_model_group.async_run_method(method_name="offload_states"))
 
     def evaluate(self, eval_dataloader, global_step, temperature=0.6, n_samples_per_prompt=1):
         """Evaluate model performance on eval dataset.
@@ -221,11 +265,17 @@ class BasePPOTrainer(ABC):
         start_time = time.time()
         logger.info(f"⏰ Evaluation start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # vLLM wakeup when vllm_enable_sleep
-        if self.strategy.args.vllm_enable_sleep:
-            from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
-
-            batch_vllm_engine_call(self.vllm_engines, "wake_up")
+        # If using arc-agi AgentExecutor, temporarily switch curriculum controller to 'eval' mode
+        controller_actor = None
+        if getattr(self.args, "start_curriculum_controller", None):
+            logger.info("Using arc-agi curriculum controller iterable for evaluation.")
+            controller_name = getattr(
+                self.args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME
+            )
+            controller_actor = ray.get_actor(controller_name)
+            # strict=True to ensure barrier before proceeding
+            logger.info(f"Setting arc-agi curriculum controller to {ARC_AGI_EVALUATION_MODE} mode.")
+            ray.get(controller_actor.set_mode.remote(ARC_AGI_EVALUATION_MODE, True))
 
         with torch.no_grad():
             # First collect all prompts and labels
@@ -297,8 +347,10 @@ class BasePPOTrainer(ABC):
                 for k, v in logs.items():
                     self._tensorboard.add_scalar(f"eval/{k}", v, global_step)
 
-        if self.strategy.args.vllm_enable_sleep:
-            batch_vllm_engine_call(self.vllm_engines, "sleep")
+        # Switch controller back to 'train' mode if we changed it
+        if controller_actor is not None:
+            logger.info(f"Switching arc-agi curriculum controller to train mode.")
+            ray.get(controller_actor.set_mode.remote("train", True))
 
         end_time = time.time()
         duration = end_time - start_time
@@ -309,7 +361,12 @@ class BasePPOTrainer(ABC):
         args = self.args
         strategy = self.strategy
 
-        # prepare datasets
+        # ARC-AGI dynamic curriculum mode: if agent_func_path is provided, use controller-backed iterable
+        if getattr(args, "agent_func_path", None):
+            self._initialize_arc_agi_iterable(args)
+            return
+
+        # Default static dataset path
         train_data = blending_datasets(
             args.prompt_data,
             args.prompt_data_probs,
@@ -352,6 +409,25 @@ class BasePPOTrainer(ABC):
             * args.num_episodes
             * args.max_epochs
         )
+
+    def _initialize_arc_agi_iterable(self, args):
+        # Determine how many items to request per pull to satisfy static batch sizes
+        target_item_count = args.vllm_generate_batch_size if args.vllm_generate_batch_size is not None else args.rollout_batch_size
+
+        # Build train/eval iterables
+        prompts_dataloader = ArcAgiCurriculumIterable(ARC_AGI_DEFAULT_CONTROLLER_NAME, target_item_count, mode="train")
+        eval_dataloader = ArcAgiCurriculumIterable(ARC_AGI_DEFAULT_CONTROLLER_NAME, 1, mode=ARC_AGI_EVALUATION_MODE)
+
+        # Ask controller for a curriculum-based max_steps estimate
+        controller = ray.get_actor(ARC_AGI_DEFAULT_CONTROLLER_NAME)
+        max_prompts = ray.get(
+            controller.get_max_prompts.remote()
+        )
+        self.max_steps = max_prompts // (
+            args.vllm_generate_batch_size if args.vllm_generate_batch_size is not None else args.rollout_batch_size)
+
+        self.prompts_dataloader = prompts_dataloader
+        self.eval_dataloader = eval_dataloader
 
     def get_max_steps(self):
         return self.max_steps
@@ -431,6 +507,20 @@ class PPOTrainer(BasePPOTrainer):
         if self.args.save_steps == -1:
             self.args.save_steps = float("inf")  # do not save ckpt
 
+        # Initialize async disk logger if enabled
+        self._exp_logger = None
+        try:
+            if getattr(self.args, "log_experience_dir", None) and getattr(self.args, "log_experience_every", -1) > 0:
+                logger.info(f"Log experience to {self.args.log_experience_dir} every {self.args.log_experience_every} steps")
+                self._exp_logger = ExperienceDiskLogger.remote(
+                    self.args.log_experience_dir, getattr(self.args, "log_experience_jsonl", False)
+                )
+                self._log_every = max(1, int(getattr(self.args, "log_experience_every", 1)))
+            else:
+                logger.warning("Experience logging is disabled.")
+        except Exception as e:
+            logger.warning(f"Failed to initialize ExperienceDiskLogger: {e}")
+
     def fit(
         self,
     ) -> None:
@@ -445,13 +535,23 @@ class PPOTrainer(BasePPOTrainer):
             logger.info(f"checkpoint_states: {checkpoint_states}")
             self._broadcast_to_vllm()
         else:
-            checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}}
+            checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}, "controller_state": {}}
+
+        # If specified eval before training, evaluate
+        if getattr(args, "eval_upon_start", None):
+            self.evaluate(self.eval_dataloader, checkpoint_states["global_step"], self.args.eval_temperature, self.args.eval_n_samples_per_prompt)
+
 
         # Restore step and start_epoch
         steps = checkpoint_states["global_step"] + 1
         episode = checkpoint_states["episode"]
         data_loader_state_dict = checkpoint_states["data_loader_state_dict"]
-        if data_loader_state_dict:
+        controller_state = checkpoint_states.get("controller_state")
+
+        # If using arc-agi controller, restore controller state as well
+        if controller_state and getattr(args, "agent_func_path", None):
+            self._restore_controller_state(controller_state)
+        elif data_loader_state_dict:
             self.prompts_dataloader.load_state_dict(data_loader_state_dict)
 
         for episode in range(episode, args.num_episodes):
@@ -461,6 +561,15 @@ class PPOTrainer(BasePPOTrainer):
                 disable=False,
                 initial=steps,
             )
+            # Curriculum-aware dynamic pbar total: set up controller and batch size if in curriculum mode
+            use_curriculum = getattr(self.args, "start_curriculum_controller", None) is not None
+            controller = None
+            batch_size_for_loader = None
+            if use_curriculum:
+                controller_name = ARC_AGI_DEFAULT_CONTROLLER_NAME
+                controller = ray.get_actor(controller_name)
+                # ArcAgiCurriculumIterable exposes target_item_count
+                batch_size_for_loader = getattr(self.prompts_dataloader, "target_item_count", None)
 
             filtered_samples = []
             number_of_samples = 0
@@ -470,6 +579,10 @@ class PPOTrainer(BasePPOTrainer):
                     rand_prompts, labels, remote_reward_model=remote_reward_model, **self.generate_kwargs
                 )
                 pbar.update()
+
+                # Periodically update progress bar total based on remaining prompts from controller
+                if use_curriculum:
+                    self._update_pbar_with_controller(batch_size_for_loader, controller, pbar)
 
                 # dynamic filtering
                 pass_rate = None
@@ -505,10 +618,18 @@ class PPOTrainer(BasePPOTrainer):
                     number_of_samples = 0
 
                 experiences = self.experience_maker.make_experience_batch(rollout_samples)
-                sample0 = self.tokenizer.batch_decode(
-                    experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True
-                )
-                print(sample0)
+
+                # Asynchronous disk logging of rollouts and experiences before any rebalancing
+                if self._exp_logger and (steps % self._log_every == 0 or steps == 1):
+                    self._log_experiences_to_disk(steps, experiences, rollout_samples)
+
+                # Select 3 samples to log
+                logging_samples = [[
+                    self.tokenizer.batch_decode(
+                        experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=False
+                    ),
+                    experiences[0].info["reward"][0]
+                ]]
 
                 # balance experiences across dp
                 if args.use_dynamic_batch:
@@ -529,15 +650,40 @@ class PPOTrainer(BasePPOTrainer):
                 # Add generated samples to status dictionary
                 if self.args.dynamic_filtering:
                     status["dynamic_filtering_pass_rate"] = pass_rate
+
+                # When using ARC-AGI curriculum controller, also log curriculum progress metrics
+                if use_curriculum:
+                    num_seen = ray.get(controller.get_num_challenges_seen.remote())
+                    num_solved = ray.get(controller.get_num_challenges_solved.remote())
+                    status["curriculum/num_challenges_seen"] = int(num_seen)
+                    status["curriculum/num_challenges_solved"] = int(num_solved)
+
+                if getattr(self.args, "start_submission_actor", None) and getattr(self.args, "submission_solution_file", None):
+                    submission_actor_name = ARC_AGI_DEFAULT_SUBMISSION_NAME
+                    submission_actor = ray.get_actor(submission_actor_name)
+                    performance_summary = ray.get(submission_actor.compute_performance_summary_snapshot.remote())
+                    for k, v in performance_summary.model_dump().items():
+                        status[f"submission/{k}"] = v
+
+
                 logger.info(f"✨ Global step {steps}: {status}")
-                status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
+                status["generated_samples"] = logging_samples
 
                 # logs/checkpoints
                 client_states = {
                     "global_step": steps,
                     "episode": episode,
-                    "data_loader_state_dict": self.prompts_dataloader.state_dict(),
                 }
+                # Include controller checkpoint state if running with arc-agi dynamic curriculum
+                if getattr(self.args, "start_curriculum_controller", None):
+                    print("Saving curriculum controller state....")
+                    controller_name = ARC_AGI_DEFAULT_CONTROLLER_NAME
+                    controller = ray.get_actor(controller_name)
+                    client_states["controller_state"] = ray.get(controller.save_curriculum_checkpoint.remote())
+                    client_states["data_loader_state_dict"] = {}
+                else:
+                    client_states["controller_state"] = {}
+                    client_states["data_loader_state_dict"] = self.prompts_dataloader.state_dict()
                 self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
 
                 steps = steps + 1
@@ -546,3 +692,41 @@ class PPOTrainer(BasePPOTrainer):
             self._wandb.finish()
         if self._tensorboard is not None:
             self._tensorboard.close()
+
+    def _log_experiences_to_disk(self, steps: int | Any, experiences,
+                                 rollout_samples):
+        try:
+            rollout_records = []
+            for s in rollout_samples:
+                sc = deepcopy(s)
+                sc.to_cpu_detached()
+                rollout_records.append(sc.to_serializable_dict())
+
+            experience_records = []
+            for e in experiences:
+                ec = deepcopy(e)
+                ec.to_cpu_detached()
+                experience_records.append(ec.to_serializable_dict())
+
+            # Fire-and-forget async writes
+            self._exp_logger.log_rollouts.remote(steps, rollout_records)
+            self._exp_logger.log_experiences.remote(steps, experience_records)
+        except Exception as e:
+            logger.warning(f"Experience logging failed at step {steps}: {e}")
+
+    def _update_pbar_with_controller(self, batch_size_for_loader: Any | None, controller, pbar):
+        remaining_prompts = ray.get(controller.get_remaining_train_prompts.remote())
+        remaining_batches = max(0, remaining_prompts // int(batch_size_for_loader))
+        print(f"Remaining prompts: {remaining_prompts}")
+        print(f"Remaining steps: {remaining_batches}")
+        new_total = pbar.n + remaining_batches
+        if pbar.total != new_total:
+            pbar.total = new_total
+            pbar.refresh()
+
+    def _restore_controller_state(self, controller_state: int | dict[Any, Any] | None):
+        print("Restoring curriculum controller state....")
+        controller_name = getattr(self.args, "curriculum_controller_name", ARC_AGI_DEFAULT_CONTROLLER_NAME)
+        controller = ray.get_actor(controller_name)
+        # load is async; wait for completion to ensure deterministic continuation
+        ray.get(controller.load_curriculum_checkpoint.remote(controller_state))
