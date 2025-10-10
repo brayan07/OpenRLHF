@@ -135,7 +135,7 @@ jobs:
 
           if exists:
             print(f"Dataset {ds_id} exists. Creating a new version...")
-            api.dataset_create_version(ds_dir, notes, convert_to_csv=False, dir_mode='zip', delete_old_versions=True)
+            api.dataset_create_version(ds_dir, notes, convert_to_csv=False, dir_mode='zip', delete_old_versions=False)
           else:
             print(f"Dataset {ds_id} not found. Creating it...")
             api.dataset_create_new(ds_dir, convert_to_csv=False, dir_mode='zip')
