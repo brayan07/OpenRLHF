@@ -370,6 +370,7 @@ class BasePPOTrainer(ABC):
         strategy = self.strategy
 
         # ARC-AGI dynamic curriculum mode: if agent_func_path is provided, use controller-backed iterable
+        logger.info("Preparing datasets...")
         if getattr(args, "agent_func_path", None):
             self._initialize_arc_agi_iterable(args)
             return
@@ -419,6 +420,7 @@ class BasePPOTrainer(ABC):
         )
 
     def _initialize_arc_agi_iterable(self, args):
+        logger.info("Initializing ARC-AGI iterable...")
         # Determine how many items to request per pull to satisfy static batch sizes
         target_item_count = args.vllm_generate_batch_size if args.vllm_generate_batch_size is not None else args.rollout_batch_size
 
@@ -544,9 +546,11 @@ class PPOTrainer(BasePPOTrainer):
     ) -> None:
         args = self.args
         inference_only = getattr(args, "inference_only", False)
+        logger.info(f"Start training in {'inference-only' if inference_only else 'training'} mode")
 
         # broadcast init checkpoint to vllm (skip in inference-only mode)
         if not inference_only:
+            # TODO: Fix checkpoint loading for inference only mode
             ckpt_path = os.path.join(args.ckpt_path, "_actor")
             if args.load_checkpoint and os.path.exists(ckpt_path):
                 checkpoint_states = ray.get(self.actor_model_group.async_run_method(method_name="get_checkpoint_states"))[
