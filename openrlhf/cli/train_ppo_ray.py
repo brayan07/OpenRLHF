@@ -50,7 +50,7 @@ def train(args):
     # init vllm / actor /critic /ref /reward model
     # if colocated, create placement group for actor and ref model explicitly.
     pg = None
-    if args.colocate_actor_ref or args.colocate_all_models:
+    if not args.inference_only and (args.colocate_actor_ref or args.colocate_all_models):
         if args.init_kl_coef > 0:
             assert (
                 args.actor_num_nodes == args.ref_num_nodes
@@ -65,7 +65,8 @@ def train(args):
     vllm_engines = None
     if args.vllm_num_engines is not None and args.vllm_num_engines > 0:
         max_len = args.max_len if args.max_len else args.prompt_max_len + args.generate_max_len
-        if args.colocate_all_models and not args.async_train:
+        # In training mode, validate colocation requirements
+        if args.colocate_all_models and not args.async_train and not args.inference_only:
             assert (
                 args.actor_num_nodes * args.actor_num_gpus_per_node
                 == args.vllm_num_engines * args.vllm_tensor_parallel_size
@@ -89,7 +90,7 @@ def train(args):
             args.enable_prefix_caching,
             args.enforce_eager,
             max_len,
-            pg if args.colocate_all_models and not args.async_train else None,
+            pg if args.colocate_all_models and not args.async_train and not args.inference_only else None,
             args.vllm_gpu_memory_utilization,
             args.vllm_enable_sleep,
             LLMRayActor,
@@ -97,66 +98,76 @@ def train(args):
             args.agent_func_path,
         )
 
-    actor_model = RayActorGroup(
-        args.actor_num_nodes,
-        args.actor_num_gpus_per_node,
-        PolicyModelActor,
-        pg=pg,
-        num_gpus_per_actor=0.5 if pg else 1,
-        duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
-    )
-
-    if args.init_kl_coef <= 0:
+    # In inference-only mode, skip all training model initialization
+    if args.inference_only:
+        actor_model = None
         ref_model = None
     else:
-        ref_model = RayActorGroup(
-            args.ref_num_nodes,
-            args.ref_num_gpus_per_node,
-            ReferenceModelActor,
+        actor_model = RayActorGroup(
+            args.actor_num_nodes,
+            args.actor_num_gpus_per_node,
+            PolicyModelActor,
             pg=pg,
             num_gpus_per_actor=0.5 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
+
+        if args.init_kl_coef <= 0:
+            ref_model = None
+        else:
+            ref_model = RayActorGroup(
+                args.ref_num_nodes,
+                args.ref_num_gpus_per_node,
+                ReferenceModelActor,
+                pg=pg,
+                num_gpus_per_actor=0.5 if pg else 1,
+                duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+            )
 
     if not args.colocate_all_models:
         pg = None
 
-    # if colocated, create placement group for critic and reward model explicitly.
-    if args.critic_pretrain and args.colocate_critic_reward:
-        assert (
-            args.critic_num_nodes == args.reward_num_nodes
-            and args.critic_num_gpus_per_node == args.reward_num_gpus_per_node
-        ), f"num_nodes and num_gpus_per_node must be the same when colocate critic and reward model."
-
-        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.critic_num_nodes * args.critic_num_gpus_per_node)]
-        pg = placement_group(bundles, strategy="PACK")
-        ray.get(pg.ready())
-
-    if args.critic_pretrain:
-        critic_model = RayActorGroup(
-            args.critic_num_nodes,
-            args.critic_num_gpus_per_node,
-            CriticModelActor,
-            pg=pg,
-            num_gpus_per_actor=0.5 if pg else 1,
-            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
-        )
-    else:
+    # In inference-only mode, skip critic and reward model initialization
+    if args.inference_only:
         critic_model = None
-
-    # multiple reward models
-    if not args.remote_rm_url:
-        reward_pretrain = args.reward_pretrain
-        reward_model = RayActorGroup(
-            args.reward_num_nodes,
-            args.reward_num_gpus_per_node,
-            RewardModelActor,
-            pg=pg,
-            num_gpus_per_actor=0.5 if pg else 1,
-            duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
-        )
-    else:
         reward_model = None
+    else:
+        # if colocated, create placement group for critic and reward model explicitly.
+        if args.critic_pretrain and args.colocate_critic_reward:
+            assert (
+                args.critic_num_nodes == args.reward_num_nodes
+                and args.critic_num_gpus_per_node == args.reward_num_gpus_per_node
+            ), f"num_nodes and num_gpus_per_node must be the same when colocate critic and reward model."
+
+            bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.critic_num_nodes * args.critic_num_gpus_per_node)]
+            pg = placement_group(bundles, strategy="PACK")
+            ray.get(pg.ready())
+
+        if args.critic_pretrain:
+            critic_model = RayActorGroup(
+                args.critic_num_nodes,
+                args.critic_num_gpus_per_node,
+                CriticModelActor,
+                pg=pg,
+                num_gpus_per_actor=0.5 if pg else 1,
+                duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+            )
+        else:
+            critic_model = None
+
+        # multiple reward models
+        if not args.remote_rm_url:
+            reward_pretrain = args.reward_pretrain
+            reward_model = RayActorGroup(
+                args.reward_num_nodes,
+                args.reward_num_gpus_per_node,
+                RewardModelActor,
+                pg=pg,
+                num_gpus_per_actor=0.5 if pg else 1,
+                duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
+            )
+        else:
+            reward_model = None
 
     if args.async_train:
         from openrlhf.trainer.ppo_trainer_async import PPOTrainerAsync as PPOTrainer
@@ -190,29 +201,31 @@ def train(args):
         from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
         batch_vllm_engine_call(vllm_engines, "sleep")
 
-    # init reference/reward/actor model
-    refs = []
-    if ref_model is not None:
-        refs.extend(ref_model.async_init_model_from_pretrained(strategy, args.pretrain))
-    refs.extend(actor_model.async_init_model_from_pretrained(strategy, args.pretrain, max_steps, vllm_engines))
-    if not args.remote_rm_url:
-        refs.extend(reward_model.async_init_model_from_pretrained(strategy, reward_pretrain))
-    ray.get(refs)
-
-    if args.critic_pretrain:
-        # critic scheduler initialization depends on max_step, so we have to init critic after actor
-        # TODO: use first reward model as critic model
-        refs.extend(critic_model.async_init_model_from_pretrained(strategy, args.critic_pretrain, max_steps))
+    # init reference/reward/actor model (skip in inference-only mode)
+    if not args.inference_only:
+        refs = []
+        if ref_model is not None:
+            refs.extend(ref_model.async_init_model_from_pretrained(strategy, args.pretrain))
+        refs.extend(actor_model.async_init_model_from_pretrained(strategy, args.pretrain, max_steps, vllm_engines))
+        if not args.remote_rm_url:
+            refs.extend(reward_model.async_init_model_from_pretrained(strategy, reward_pretrain))
         ray.get(refs)
+
+        if args.critic_pretrain:
+            # critic scheduler initialization depends on max_step, so we have to init critic after actor
+            # TODO: use first reward model as critic model
+            refs.extend(critic_model.async_init_model_from_pretrained(strategy, args.critic_pretrain, max_steps))
+            ray.get(refs)
 
     # train actor and critic model
     ray.get(ppo_trainer.fit.remote())
 
-    # save model
-    ray.get(actor_model.async_save_model())
+    # save model (skip in inference-only mode)
+    if not args.inference_only:
+        ray.get(actor_model.async_save_model())
 
-    if args.critic_pretrain and args.save_value_network:
-        ray.get(critic_model.async_save_model())
+        if args.critic_pretrain and args.save_value_network:
+            ray.get(critic_model.async_save_model())
 
 
 def get_or_create_submission_actor(args):
@@ -382,6 +395,14 @@ def get_parser():
 
     # Async training using ray
     parser.add_argument("--async_train", action="store_true", default=False, help="Enable async training")
+    
+    # Inference-only mode (no training)
+    parser.add_argument(
+        "--inference_only",
+        action="store_true",
+        default=False,
+        help="Run in inference-only mode without initializing training models (actor/critic/ref/reward). Only vLLM engines will be used for generation.",
+    )
 
     # Arc-AGI curriculum integration
     parser.add_argument(
@@ -777,10 +798,25 @@ if __name__ == "__main__":
             args.n_samples_per_prompt > 1
         ), "n_samples_per_prompt must be greater than 1 when using dynamic filtering"
 
-    assert (
-        args.n_samples_per_prompt * args.rollout_batch_size // args.micro_rollout_batch_size
-        >= args.actor_num_nodes * args.actor_num_gpus_per_node // args.ring_attn_size // args.ds_tensor_parallel_size
-    ), "The number of sample batches must be greater than or equal to the effective number of actor processes."
+    # Inference-only mode validation
+    if args.inference_only:
+        assert args.vllm_num_engines is not None and args.vllm_num_engines > 0, (
+            "Inference-only mode requires vLLM engines. Please set --vllm_num_engines > 0"
+        )
+        if args.async_train:
+            print("[Warning] --async_train is ignored in inference-only mode")
+            args.async_train = False
+        if args.colocate_all_models or args.colocate_actor_ref or args.colocate_critic_reward:
+            print("[Warning] Colocation flags are ignored in inference-only mode (no training models to colocate)")
+        if args.vllm_enable_sleep:
+            print("[Warning] --vllm_enable_sleep is typically used with --colocate_all_models for training. In inference-only mode, vLLM engines run independently.")
+        # No need for critic/reward models in inference mode, these are already skipped
+
+    if not args.inference_only:
+        assert (
+            args.n_samples_per_prompt * args.rollout_batch_size // args.micro_rollout_batch_size
+            >= args.actor_num_nodes * args.actor_num_gpus_per_node // args.ring_attn_size // args.ds_tensor_parallel_size
+        ), "The number of sample batches must be greater than or equal to the effective number of actor processes."
 
     if args.use_ms:
         from modelscope.utils.hf_util import patch_hub

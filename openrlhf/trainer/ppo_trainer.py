@@ -136,6 +136,10 @@ class BasePPOTrainer(ABC):
         raise NotImplementedError("fit method is not implemented")
 
     def ppo_train(self, global_steps):
+        # Skip training entirely in inference-only mode
+        if self.actor_model_group is None:
+            return {}
+            
         status = {}
 
         # triger remote critic model training
@@ -173,6 +177,10 @@ class BasePPOTrainer(ABC):
         return status
 
     def _broadcast_to_vllm(self):
+        # Skip if actor model is not initialized (inference-only mode)
+        if self.actor_model_group is None:
+            return
+            
         if self.strategy.args.vllm_enable_sleep:
             from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
 
@@ -470,10 +478,16 @@ class PPOTrainer(BasePPOTrainer):
             **generate_kwargs,
         )
 
-        if self.kl_target:
-            self.kl_ctl = AdaptiveKLController(self.init_kl_coef, self.kl_target, self.kl_horizon)
+        # Skip training-specific initialization in inference-only mode
+        inference_only = getattr(self.args, "inference_only", False)
+        
+        if not inference_only:
+            if self.kl_target:
+                self.kl_ctl = AdaptiveKLController(self.init_kl_coef, self.kl_target, self.kl_horizon)
+            else:
+                self.kl_ctl = FixedKLController(self.init_kl_coef)
         else:
-            self.kl_ctl = FixedKLController(self.init_kl_coef)
+            self.kl_ctl = None
 
         if self.args.remote_rm_url and not self.args.remote_rm_url[0] == "agent":
             from openrlhf.utils.remote_rm_utils import RemoteRewardModel
@@ -487,16 +501,20 @@ class PPOTrainer(BasePPOTrainer):
             self.prompt_max_len,
         )
 
-        self.experience_maker = RemoteExperienceMaker(
-            self.actor_model_group,
-            self.critic_model_group,
-            self.reward_model_group,
-            self.reference_model_group,
-            self.kl_ctl,
-            self.strategy,
-            self.tokenizer,
-            remote_reward_model=self.remote_reward_model,
-        )
+        # Skip experience maker in inference-only mode (only needed for training)
+        if not inference_only:
+            self.experience_maker = RemoteExperienceMaker(
+                self.actor_model_group,
+                self.critic_model_group,
+                self.reward_model_group,
+                self.reference_model_group,
+                self.kl_ctl,
+                self.strategy,
+                self.tokenizer,
+                remote_reward_model=self.remote_reward_model,
+            )
+        else:
+            self.experience_maker = None
 
         self.prepare_datasets()
         self._init_wandb()
@@ -525,15 +543,19 @@ class PPOTrainer(BasePPOTrainer):
         self,
     ) -> None:
         args = self.args
+        inference_only = getattr(args, "inference_only", False)
 
-        # broadcast init checkpoint to vllm
-        ckpt_path = os.path.join(args.ckpt_path, "_actor")
-        if args.load_checkpoint and os.path.exists(ckpt_path):
-            checkpoint_states = ray.get(self.actor_model_group.async_run_method(method_name="get_checkpoint_states"))[
-                0
-            ]
-            logger.info(f"checkpoint_states: {checkpoint_states}")
-            self._broadcast_to_vllm()
+        # broadcast init checkpoint to vllm (skip in inference-only mode)
+        if not inference_only:
+            ckpt_path = os.path.join(args.ckpt_path, "_actor")
+            if args.load_checkpoint and os.path.exists(ckpt_path):
+                checkpoint_states = ray.get(self.actor_model_group.async_run_method(method_name="get_checkpoint_states"))[
+                    0
+                ]
+                logger.info(f"checkpoint_states: {checkpoint_states}")
+                self._broadcast_to_vllm()
+            else:
+                checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}, "controller_state": {}}
         else:
             checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}, "controller_state": {}}
 
@@ -584,6 +606,55 @@ class PPOTrainer(BasePPOTrainer):
                 if use_curriculum:
                     self._update_pbar_with_controller(batch_size_for_loader, controller, pbar)
 
+                # In inference-only mode, skip training and just log samples
+                if inference_only:
+                    # Extract logging data from rollout_samples
+                    logging_samples = [[
+                        self.tokenizer.batch_decode(
+                            rollout_samples[0].sequences[0].unsqueeze(0), skip_special_tokens=False
+                        ),
+                        rollout_samples[0].scores[0].item() if rollout_samples[0].scores is not None else 0.0
+                    ]]
+                    
+                    status = {"inference_mode": True}
+                    
+                    # When using ARC-AGI curriculum controller, also log curriculum progress metrics
+                    if use_curriculum:
+                        num_seen = ray.get(controller.get_num_challenges_seen.remote())
+                        num_solved = ray.get(controller.get_num_challenges_solved.remote())
+                        status["curriculum/num_challenges_seen"] = int(num_seen)
+                        status["curriculum/num_challenges_solved"] = int(num_solved)
+
+                    if getattr(self.args, "start_submission_actor", None) and getattr(self.args, "submission_solution_file", None):
+                        submission_actor_name = ARC_AGI_DEFAULT_SUBMISSION_NAME
+                        submission_actor = ray.get_actor(submission_actor_name)
+                        performance_summary = ray.get(submission_actor.compute_performance_summary_snapshot.remote())
+                        for k, v in performance_summary.model_dump().items():
+                            status[f"submission/{k}"] = v
+
+                    logger.info(f"✨ Global step {steps}: {status}")
+                    status["generated_samples"] = logging_samples
+
+                    # logs/checkpoints
+                    client_states = {
+                        "global_step": steps,
+                        "episode": episode,
+                    }
+                    # Include controller checkpoint state if running with arc-agi dynamic curriculum
+                    if getattr(self.args, "start_curriculum_controller", None):
+                        print("Saving curriculum controller state....")
+                        controller_name = ARC_AGI_DEFAULT_CONTROLLER_NAME
+                        controller = ray.get_actor(controller_name)
+                        client_states["controller_state"] = ray.get(controller.save_curriculum_checkpoint.remote())
+                        client_states["data_loader_state_dict"] = {}
+                    else:
+                        client_states["controller_state"] = {}
+                        client_states["data_loader_state_dict"] = self.prompts_dataloader.state_dict()
+                    self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
+
+                    steps = steps + 1
+                    continue
+
                 # dynamic filtering
                 pass_rate = None
                 if self.args.dynamic_filtering:
@@ -617,6 +688,7 @@ class PPOTrainer(BasePPOTrainer):
                     filtered_samples = []
                     number_of_samples = 0
 
+                # Training mode: create experiences and train
                 experiences = self.experience_maker.make_experience_batch(rollout_samples)
 
                 # Asynchronous disk logging of rollouts and experiences before any rebalancing
