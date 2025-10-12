@@ -193,9 +193,7 @@ def train(args):
         temperature=args.temperature,
         top_p=args.top_p,
     )
-    # training update steps
-    max_steps = ray.get(ppo_trainer.get_max_steps.remote())
-
+    
     # Batch sleep engines
     if args.vllm_enable_sleep:
         from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
@@ -203,6 +201,9 @@ def train(args):
 
     # init reference/reward/actor model (skip in inference-only mode)
     if not args.inference_only:
+        # training update steps (only needed for model initialization in training mode)
+        max_steps = ray.get(ppo_trainer.get_max_steps.remote())
+        
         refs = []
         if ref_model is not None:
             refs.extend(ref_model.async_init_model_from_pretrained(strategy, args.pretrain))
