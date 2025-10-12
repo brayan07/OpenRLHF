@@ -26,6 +26,64 @@ def get_tokenizer(pretrain, model, padding_side="left", strategy=None, use_fast=
     tokenizer.padding_side = padding_side
     # NOTE: When enable vLLM, do not resize_token_embeddings, or the vocab size will mismatch with vLLM.
     # https://github.com/facebookresearch/llama-recipes/pull/196
+    # Prefer explicit pad_token_id if provided; fallback to legacy pad_token_string for backward compatibility
+    if strategy is not None and hasattr(strategy, "args"):
+        pad_id = getattr(strategy.args, "pad_token_id", None)
+        pad_str = getattr(strategy.args, "pad_token_string", None)
+        if pad_id is not None and pad_str:
+            # Both provided: ensure they map to each other
+            pad_id = int(pad_id)
+            # String must map to exactly one id
+            str_ids = tokenizer.encode(pad_str, add_special_tokens=False)
+            if len(str_ids) != 1:
+                raise ValueError(
+                    f"pad_token_string '{pad_str}' must map to exactly one token id, got ids={str_ids}"
+                )
+            if str_ids[0] != pad_id:
+                raise ValueError(
+                    f"pad_token_id ({pad_id}) and pad_token_string ('{pad_str}', id={str_ids[0]}) are inconsistent"
+                )
+            # Ensure the id maps to a valid string-like token
+            pad_tok = tokenizer.convert_ids_to_tokens(pad_id)
+            if pad_tok is None or not isinstance(pad_tok, str) or len(pad_tok) == 0:
+                raise ValueError(
+                    f"pad_token_id {pad_id} does not map to a valid string token via tokenizer.convert_ids_to_tokens"
+                )
+            tokenizer.pad_token_id = pad_id
+            tokenizer.pad_token = pad_str  # prefer explicit provided string
+            if model is not None:
+                model.config.pad_token_id = tokenizer.pad_token_id
+        elif pad_id is not None:
+            # Only id provided: ensure it maps to a string-like token
+            pad_id = int(pad_id)
+            pad_tok = tokenizer.convert_ids_to_tokens(pad_id)
+            if pad_tok is None or not isinstance(pad_tok, str) or len(pad_tok) == 0:
+                raise ValueError(
+                    f"pad_token_id {pad_id} does not map to a valid string token via tokenizer.convert_ids_to_tokens"
+                )
+            tokenizer.pad_token_id = pad_id
+            tokenizer.pad_token = pad_tok
+            if model is not None:
+                model.config.pad_token_id = tokenizer.pad_token_id
+        elif pad_str:
+            # Only string provided: must map to exactly one id
+            token_ids = tokenizer.encode(pad_str, add_special_tokens=False)
+            if len(token_ids) != 1:
+                raise ValueError(
+                    f"pad_token_string '{pad_str}' must map to exactly one token id, got ids={token_ids}"
+                )
+            # Optionally ensure the resolved id maps back to a string-like token if supported
+            if hasattr(tokenizer, "convert_ids_to_tokens"):
+                back_tok = tokenizer.convert_ids_to_tokens(token_ids[0])
+                if back_tok is None or not isinstance(back_tok, str) or len(back_tok) == 0:
+                    raise ValueError(
+                        f"pad_token_string '{pad_str}' resolved to id {token_ids[0]} which does not map to a valid string token"
+                    )
+            tokenizer.pad_token = pad_str
+            tokenizer.pad_token_id = token_ids[0]
+            if model is not None:
+                model.config.pad_token_id = tokenizer.pad_token_id
+    # Otherwise, ensure pad token is set (fallback to eos)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
