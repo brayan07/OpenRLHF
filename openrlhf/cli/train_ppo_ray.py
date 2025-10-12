@@ -298,7 +298,8 @@ def get_or_create_curriculum_controller(args):
                 ControllerRemote.options(**controller_kwargs).remote(
                     storage_db_file=storage_db_file,
                     run_distributed=True,
-                    storage_actor_name=ARC_AGI_DEFAULT_STORAGE_NAME
+                    storage_actor_name=ARC_AGI_DEFAULT_STORAGE_NAME,
+                    challenge_stopping_criteria=args.curriculum_controller_stopping_criteria,
                 )
             )
 
@@ -388,6 +389,15 @@ def get_parser():
         action="store_true",
         default=False,
         help="Start an arc-agi CurriculumController as a detached Ray actor before training.",
+    )
+    parser.add_argument(
+        "--curriculum_controller_stopping_criteria",
+        type=str,
+        choices=["eval", "inference"],
+        default="inference",
+        help=(
+            "Stopping criteria for challenges in the curriculum controller; must be one of 'eval' or 'inference'."
+        ),
     )
 
     # Arc-AGI Unified storage configuration
