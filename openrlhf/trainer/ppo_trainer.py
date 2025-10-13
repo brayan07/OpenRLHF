@@ -229,7 +229,7 @@ class BasePPOTrainer(ABC):
             self.evaluate(self.eval_dataloader, global_step, args.eval_temperature, args.eval_n_samples_per_prompt)
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
-        if global_step % args.save_steps == 0:
+        if global_step % args.save_steps == 0 and not args.inference_only:
             tag = f"global_step{global_step}"
             # If colocated with vLLM and sleep mode is enabled, ensure vLLM engines are asleep
             if self.vllm_engines is not None and getattr(self.args, "vllm_enable_sleep", False):
