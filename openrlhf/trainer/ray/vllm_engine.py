@@ -134,6 +134,7 @@ def create_vllm_engines(
     distributed_executor_backend = "uni" if tensor_parallel_size == 1 else "ray"
     use_hybrid_engine = shared_pg is not None
     num_gpus = int(tensor_parallel_size == 1)
+    num_cpus = 0.9
     if use_hybrid_engine and tensor_parallel_size == 1:
         # every worker will use 0.2 GPU, so that we can schedule
         # 2 instances on the same GPUs.
@@ -166,7 +167,7 @@ def create_vllm_engines(
 
         vllm_engines.append(
             llm_actor_cls.options(
-                num_cpus=num_gpus,
+                num_cpus=num_cpus,
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
             ).remote(
