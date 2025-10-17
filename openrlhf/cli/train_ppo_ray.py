@@ -18,7 +18,9 @@ from arc_agi.agent_based_rl.settings import (
     SUBMISSION_ACTOR_DEFAULT_NAME as ARC_AGI_DEFAULT_SUBMISSION_NAME,
     CURRICULUM_CONTROLLER_ACTOR_RESERVED_CPUS as ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS,
     SUBMISSION_ACTOR_NUM_CPUS as ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS,
+    BUNDLE_ACTORS_WITH_VLLM_PG as ARC_AGI_BUNDLE_ACTORS_WITH_VLLM_PG,
 )
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from openrlhf.trainer.ray import create_vllm_engines
 from openrlhf.trainer.ray.launcher import (
@@ -33,15 +35,9 @@ from openrlhf.utils import get_strategy
 
 def train(args):
     # initialize ray if not initialized
+    # TODO: Set num gpus more intelligently depending on what actors are enabled
     if not ray.is_initialized():
         ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}})
-
-    # Optionally start a detached arc-agi CurriculumController actor so that
-    # AgentExecutor in arc-agi can resolve it via ray.get_actor(name).
-    get_or_create_curriculum_controller(args)
-
-    # Optionally start a detached arc-agi SubmissionActor to periodically write submission.json
-    get_or_create_submission_actor(args)
 
     # configure strategy
     strategy = get_strategy(args)
@@ -50,7 +46,7 @@ def train(args):
     # init vllm / actor /critic /ref /reward model
     # if colocated, create placement group for actor and ref model explicitly.
     pg = None
-    if not args.inference_only and (args.colocate_actor_ref or args.colocate_all_models):
+    if args.colocate_actor_ref or args.colocate_all_models:
         if args.init_kl_coef > 0:
             assert (
                 args.actor_num_nodes == args.ref_num_nodes
@@ -66,7 +62,7 @@ def train(args):
     if args.vllm_num_engines is not None and args.vllm_num_engines > 0:
         max_len = args.max_len if args.max_len else args.prompt_max_len + args.generate_max_len
         # In training mode, validate colocation requirements
-        if args.colocate_all_models and not args.async_train and not args.inference_only:
+        if args.colocate_all_models and not args.async_train:
             assert (
                 args.actor_num_nodes * args.actor_num_gpus_per_node
                 == args.vllm_num_engines * args.vllm_tensor_parallel_size
@@ -90,13 +86,19 @@ def train(args):
             args.enable_prefix_caching,
             args.enforce_eager,
             max_len,
-            pg if args.colocate_all_models and not args.async_train and not args.inference_only else None,
+            pg if args.colocate_all_models and not args.async_train else None,
             args.vllm_gpu_memory_utilization,
             args.vllm_enable_sleep,
             LLMRayActor,
             "processed_logprobs" if args.enable_vllm_is_correction else None,
             args.agent_func_path,
         )
+        # Optionally start a detached arc-agi CurriculumController actor so that
+        # AgentExecutor in arc-agi can resolve it via ray.get_actor(name).
+        get_or_create_curriculum_controller(args, pg=pg)
+
+        # Optionally start a detached arc-agi SubmissionActor to periodically write submission.json
+        get_or_create_submission_actor(args, pg=pg)
 
     # In inference-only mode, skip all training model initialization
     if args.inference_only:
@@ -229,7 +231,7 @@ def train(args):
             ray.get(critic_model.async_save_model())
 
 
-def get_or_create_submission_actor(args):
+def get_or_create_submission_actor(args, pg=None):
     if getattr(args, "start_submission_actor", False):
         # If already exists, skip creation
         try:
@@ -258,10 +260,20 @@ def get_or_create_submission_actor(args):
             submission_kwargs = {
                 "name": ARC_AGI_DEFAULT_SUBMISSION_NAME,
                 "lifetime": "detached",
-                "scheduling_strategy": "DEFAULT",
             }
             if ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS:
                 submission_kwargs["num_cpus"] = ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS
+            if ARC_AGI_BUNDLE_ACTORS_WITH_VLLM_PG:
+                print("Bundling submission actor with vLLM placement group")
+                if pg is None:
+                    raise ValueError("Placement group is required when bundling actors with vLLM.")
+                submission_kwargs["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=-1,
+                )
+            else:
+                submission_kwargs["scheduling_strategy"] = "DEFAULT"
             submission_actor = (
                 SubmissionRemote.options(**submission_kwargs).remote(
                     storage_db_file=storage_db_file,
@@ -284,7 +296,8 @@ def get_or_create_submission_actor(args):
                 )
 
 
-def get_or_create_curriculum_controller(args):
+def get_or_create_curriculum_controller(args, pg=None):
+    # TODO: Add pg logic
     if getattr(args, "start_curriculum_controller", False):
         # If already exists, skip creation.
         try:
@@ -304,16 +317,27 @@ def get_or_create_curriculum_controller(args):
             controller_kwargs = {
                 "name": ARC_AGI_DEFAULT_CONTROLLER_NAME,
                 "lifetime": "detached",
-                "scheduling_strategy": "DEFAULT",
             }
             if ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS:
                 controller_kwargs["num_cpus"] = ARC_AGI_CURRICULUM_CONTROLLER_ACTOR_NUM_CPUS
+            if ARC_AGI_BUNDLE_ACTORS_WITH_VLLM_PG:
+                print("Bundling submission actor with vLLM placement group")
+                if pg is None:
+                    raise ValueError("Placement group is required when bundling actors with vLLM.")
+                controller_kwargs["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=-1,
+                )
+            else:
+                controller_kwargs["scheduling_strategy"] = "DEFAULT"
             controller = (
                 ControllerRemote.options(**controller_kwargs).remote(
                     storage_db_file=storage_db_file,
                     run_distributed=True,
                     storage_actor_name=ARC_AGI_DEFAULT_STORAGE_NAME,
                     challenge_stopping_criteria=args.curriculum_controller_stopping_criteria,
+                    shuffle_queue=True,
                 )
             )
 
