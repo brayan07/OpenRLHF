@@ -3,7 +3,7 @@ import time
 from copy import deepcopy
 from abc import ABC
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
 import ray
 import torch
@@ -97,6 +97,21 @@ class BasePPOTrainer(ABC):
             from openrlhf.trainer.ppo_utils.experience_maker import SamplesGenerator
 
         self.generator_cls = SamplesGenerator
+
+        # Initialize async disk logger if enabled
+        self._exp_logger = None
+        try:
+            if getattr(self.args, "log_experience_dir", None) and getattr(self.args, "log_experience_every", -1) > 0:
+                logger.info(
+                    f"Log experience to {self.args.log_experience_dir} every {self.args.log_experience_every} steps")
+                self._exp_logger = ExperienceDiskLogger.remote(
+                    self.args.log_experience_dir
+                )
+                self._log_every = max(1, int(getattr(self.args, "log_experience_every", 1)))
+            else:
+                logger.warning("Experience logging is disabled.")
+        except Exception as e:
+            logger.warning(f"Failed to initialize ExperienceDiskLogger: {e}")
 
     def _init_wandb(self):
         # wandb/tensorboard setting
@@ -306,6 +321,10 @@ class BasePPOTrainer(ABC):
                 all_prompts, all_labels, remote_reward_model=self.remote_reward_model, **generate_kwargs
             )
 
+            # Asynchronous disk logging of rollouts and experiences before any rebalancing
+            if self._exp_logger and (global_step % self._log_every == 0 or global_step == 1):
+                self._log_experiences_to_disk(global_step, [], samples_list, mode="eval")
+
             # duplicate prompts and labels for each sample
             all_prompts = sum([s.prompts for s in samples_list], [])
             all_labels = sum([s.labels for s in samples_list], [])
@@ -423,7 +442,10 @@ class BasePPOTrainer(ABC):
         target_item_count = args.vllm_generate_batch_size if args.vllm_generate_batch_size is not None else args.rollout_batch_size
 
         # Build train/eval iterables
+        print(f"Initializing prompts dataloader with target item count: {target_item_count}")
         prompts_dataloader = ArcAgiCurriculumIterable(ARC_AGI_DEFAULT_CONTROLLER_NAME, target_item_count, mode="train")
+
+        print(f"Initializing eval dataloader with mode: {ARC_AGI_EVALUATION_MODE} and target item count: 1")
         eval_dataloader = ArcAgiCurriculumIterable(ARC_AGI_DEFAULT_CONTROLLER_NAME, 1, mode=ARC_AGI_EVALUATION_MODE)
 
         # Ask controller for a curriculum-based max_steps estimate
@@ -439,6 +461,27 @@ class BasePPOTrainer(ABC):
 
     def get_max_steps(self):
         return self.max_steps
+
+    def _log_experiences_to_disk(self, steps: int | Any, experiences,
+                                 rollout_samples, mode: Literal["train","eval"]="train"):
+        try:
+            rollout_records = []
+            for s in rollout_samples:
+                sc = deepcopy(s)
+                sc.to_cpu_detached()
+                rollout_records.append(sc.to_serializable_dict())
+
+            experience_records = []
+            for e in experiences:
+                ec = deepcopy(e)
+                ec.to_cpu_detached()
+                experience_records.append(ec.to_serializable_dict())
+
+            # Fire-and-forget async writes
+            self._exp_logger.log_rollouts.remote(steps, rollout_records, mode=mode)
+            self._exp_logger.log_experiences.remote(steps, experience_records, mode=mode)
+        except Exception as e:
+            logger.warning(f"Experience logging failed at step {steps}: {e}")
 
 
 @ray.remote
@@ -525,20 +568,6 @@ class PPOTrainer(BasePPOTrainer):
         if self.args.save_steps == -1:
             self.args.save_steps = float("inf")  # do not save ckpt
 
-        # Initialize async disk logger if enabled
-        self._exp_logger = None
-        try:
-            if getattr(self.args, "log_experience_dir", None) and getattr(self.args, "log_experience_every", -1) > 0:
-                logger.info(f"Log experience to {self.args.log_experience_dir} every {self.args.log_experience_every} steps")
-                self._exp_logger = ExperienceDiskLogger.remote(
-                    self.args.log_experience_dir, getattr(self.args, "log_experience_jsonl", False)
-                )
-                self._log_every = max(1, int(getattr(self.args, "log_experience_every", 1)))
-            else:
-                logger.warning("Experience logging is disabled.")
-        except Exception as e:
-            logger.warning(f"Failed to initialize ExperienceDiskLogger: {e}")
-
     def fit(
         self,
     ) -> None:
@@ -617,6 +646,10 @@ class PPOTrainer(BasePPOTrainer):
                     ]]
                     
                     status = {"inference_mode": True}
+
+                    # Asynchronous disk logging of rollouts and experiences before any rebalancing
+                    if self._exp_logger and (steps % self._log_every == 0 or steps == 1):
+                        self._log_experiences_to_disk(steps, [], rollout_samples, mode="train")
                     
                     # When using ARC-AGI curriculum controller, also log curriculum progress metrics
                     if use_curriculum:
@@ -693,7 +726,7 @@ class PPOTrainer(BasePPOTrainer):
 
                 # Asynchronous disk logging of rollouts and experiences before any rebalancing
                 if self._exp_logger and (steps % self._log_every == 0 or steps == 1):
-                    self._log_experiences_to_disk(steps, experiences, rollout_samples)
+                    self._log_experiences_to_disk(steps, experiences, rollout_samples, mode="train")
 
                 # Select 3 samples to log
                 logging_samples = [[
@@ -765,26 +798,7 @@ class PPOTrainer(BasePPOTrainer):
         if self._tensorboard is not None:
             self._tensorboard.close()
 
-    def _log_experiences_to_disk(self, steps: int | Any, experiences,
-                                 rollout_samples):
-        try:
-            rollout_records = []
-            for s in rollout_samples:
-                sc = deepcopy(s)
-                sc.to_cpu_detached()
-                rollout_records.append(sc.to_serializable_dict())
 
-            experience_records = []
-            for e in experiences:
-                ec = deepcopy(e)
-                ec.to_cpu_detached()
-                experience_records.append(ec.to_serializable_dict())
-
-            # Fire-and-forget async writes
-            self._exp_logger.log_rollouts.remote(steps, rollout_records)
-            self._exp_logger.log_experiences.remote(steps, experience_records)
-        except Exception as e:
-            logger.warning(f"Experience logging failed at step {steps}: {e}")
 
     def _update_pbar_with_controller(self, batch_size_for_loader: Any | None, controller, pbar):
         remaining_prompts = ray.get(controller.get_remaining_train_prompts.remote())

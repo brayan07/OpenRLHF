@@ -75,13 +75,13 @@ def test_disk_logger_writes_lists_without_rebatching(tmp_path, ray_cluster):
     rollout_records = [s.to_serializable_dict() for s in rollout_samples]
     experience_records = [e.to_serializable_dict() for e in experiences]
 
-    logger = ExperienceDiskLogger.remote(str(tmp_path), write_jsonl=False)
+    logger = ExperienceDiskLogger.remote(str(tmp_path))
     ray.get(logger.log_rollouts.remote(123, rollout_records))
     ray.get(logger.log_experiences.remote(123, experience_records))
 
     # Verify files exist
-    r_path = tmp_path / "rollouts_step000123.pt"
-    e_path = tmp_path / "experiences_step000123.pt"
+    r_path = tmp_path / "rollouts_train_step000123.pt"
+    e_path = tmp_path / "experiences_train_step000123.pt"
     assert r_path.exists()
     assert e_path.exists()
 
@@ -103,7 +103,7 @@ def test_disk_logger_writes_lists_without_rebatching(tmp_path, ray_cluster):
     assert r_loaded[1]["prompts"][0] == "p1"
 
 
-def test_disk_logger_optional_jsonl(tmp_path, ray_cluster):
+def test_disk_logger_supports_mode_suffix(tmp_path, ray_cluster):
     from openrlhf.utils.experience_logger import ExperienceDiskLogger
 
     samples = [make_sample_experience(l, prompt=f"p{i}", label=f"l{i}") for i, l in enumerate([4, 6, 5])]
@@ -111,24 +111,12 @@ def test_disk_logger_optional_jsonl(tmp_path, ray_cluster):
         s.to_cpu_detached()
     records = [s.to_serializable_dict() for s in samples]
 
-    # Provide lightweight JSONL records manually (implementation may use Experience.to_jsonl_record later)
-    jsonl_records = [
-        {"prompt": r["prompts"][0], "label": r["labels"][0], "response_length": int(r["info"]["response_length"][0])}
-        for r in records
-    ]
+    logger = ExperienceDiskLogger.remote(str(tmp_path))
+    ray.get(logger.log_rollouts.remote(5, records, mode="eval"))
 
-    logger = ExperienceDiskLogger.remote(str(tmp_path), write_jsonl=True)
-    ray.get(logger.log_rollouts.remote(5, records, jsonl_records))
-
-    # Verify JSONL exists and has same number of lines
-    jsonl_path = tmp_path / "rollouts.jsonl"
-    assert jsonl_path.exists()
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        lines = [json.loads(line) for line in f]
-    assert len(lines) >= len(jsonl_records)  # allow multiple appends across runs
-    # Check the last N entries match current batch
-    tail = lines[-len(jsonl_records) :]
-    assert [t["prompt"] for t in tail] == [r["prompt"] for r in jsonl_records]
+    # Verify the eval suffix appears in the filename
+    path = tmp_path / "rollouts_eval_step000005.pt"
+    assert path.exists()
 
 
 @pytest.mark.usefixtures("ray_cluster")
@@ -141,11 +129,11 @@ def test_load_experience_file_roundtrip(tmp_path):
         s.to_cpu_detached()
     records = [s.to_serializable_dict() for s in samples]
 
-    logger = ExperienceDiskLogger.remote(str(tmp_path), write_jsonl=False)
+    logger = ExperienceDiskLogger.remote(str(tmp_path))
     ray.get(logger.log_experiences.remote(42, records))
 
     # load back as Experience objects
-    path = tmp_path / "experiences_step000042.pt"
+    path = tmp_path / "experiences_train_step000042.pt"
     loaded = load_experience_file(str(path))
     assert len(loaded) == len(records)
     # spot check: type and a few fields
@@ -159,24 +147,19 @@ def test_load_experience_file_roundtrip(tmp_path):
 def test_iter_jsonl_reads_back(tmp_path):
     from openrlhf.utils.experience_logger import ExperienceDiskLogger, iter_jsonl
 
-    samples = [make_sample_experience(l, prompt=f"pp{i}", label=f"ll{i}") for i, l in enumerate([3, 7])]
-    for s in samples:
-        s.to_cpu_detached()
-    records = [s.to_serializable_dict() for s in samples]
-
     jsonl_records = [
-        {"prompt": r["prompts"][0], "label": r["labels"][0], "response_length": int(r["info"]["response_length"][0])}
-        for r in records
+        {"prompt": f"pp{i}", "label": f"ll{i}", "response_length": i + 3}
+        for i in range(2)
     ]
 
-    logger = ExperienceDiskLogger.remote(str(tmp_path), write_jsonl=True)
-    ray.get(logger.log_rollouts.remote(7, records, jsonl_records))
+    jsonl_path = tmp_path / "rollouts.jsonl"
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for entry in jsonl_records:
+            f.write(json.dumps(entry) + "\n")
 
-    # read via utility and compare tail
-    it = list(iter_jsonl(str(tmp_path / "rollouts.jsonl")))
-    assert len(it) >= len(jsonl_records)
-    tail = it[-len(jsonl_records):]
-    assert [t["prompt"] for t in tail] == [r["prompt"] for r in jsonl_records]
+    # read via utility and compare
+    it = list(iter_jsonl(str(jsonl_path)))
+    assert it == jsonl_records
 
 
 def test_cli_has_experience_logging_flags(monkeypatch):

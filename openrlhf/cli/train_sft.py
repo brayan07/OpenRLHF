@@ -139,6 +139,12 @@ def train(args):
         disable_ds_ckpt=args.disable_ds_ckpt,
     )
 
+    # Optionally evaluate upon start (before training), if eval dataset is provided
+    if getattr(args, "eval_upon_start", False) and eval_dataloader is not None and len(eval_dataloader) > 0:
+        # Derive initial global step consistent with SFTTrainer.fit
+        initial_global_step = (consumed_samples // args.train_batch_size)
+        trainer.evaluate(eval_dataloader, steps=initial_global_step)
+
     trainer.fit(args, consumed_samples, num_update_steps_per_epoch)
 
     # save model checkpoint after fitting on only rank0
@@ -189,6 +195,26 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_comm", action="store_true", default=False)
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true", default=False)
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
+    # Tokenization options
+    parser.add_argument(
+        "--pad_token_id",
+        type=int,
+        default=None,
+        help=(
+            "Custom pad token id to use. Will set tokenizer.pad_token_id and attempt to set "
+            "tokenizer.pad_token accordingly. If both --pad_token_id and --pad_token_string are set, "
+            "they must map to each other or an error will be raised."
+        ),
+    )
+    parser.add_argument(
+        "--pad_token_string",
+        type=str,
+        default=None,
+        help=(
+            "Custom pad token string to use. Must correspond to exactly one tokenizer id. If both "
+            "--pad_token_id and --pad_token_string are set, they must map to each other or an error will be raised."
+        ),
+    )
     parser.add_argument("--ds_tensor_parallel_size", type=int, default=1, help="DeepSpeed Tensor parallel size")
 
     # SFT
@@ -229,6 +255,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval_dataset", type=str, default=None, help="Path to the evaluation dataset")
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--eval_split", type=str, default="train")
+    parser.add_argument("--eval_upon_start", action="store_true", default=False, help="Run a single evaluation pass before training starts if an eval dataset is provided")
     parser.add_argument("--max_samples", type=int, default=1000000, help="Maximum number of samples to use")
     parser.add_argument("--train_split", type=str, default="train", help="train split of the HF dataset")
     parser.add_argument("--multiturn", action="store_true", default=False, help="Use compacted multiturn dataset")
