@@ -34,6 +34,8 @@ from openrlhf.utils import get_strategy
 
 
 def train(args):
+    # Training starts here. All argument validation should be done in __main__ before calling train(args).
+
     # initialize ray if not initialized
     # TODO: Set num gpus more intelligently depending on what actors are enabled
     if not ray.is_initialized():
@@ -417,6 +419,17 @@ def get_parser():
     # Your Efficient RL Framework Secretly Brings You Off-Policy RL Training: https://fengyao.notion.site/off-policy-rl
     parser.add_argument("--enable_vllm_is_correction", action="store_true", default=False)
     parser.add_argument("--vllm_is_truncated_threshold", type=float, default=2)
+    # Dynamic LoRA integration with vLLM (OpenRLHF-only, no vLLM changes)
+    parser.add_argument(
+        "--vllm_dynamic_lora",
+        action="store_true",
+        default=False,
+        help=(
+            "Use dynamic LoRA adapter syncing to vLLM engines each PPO sync step. "
+            "When enabled with --lora_rank>0, this becomes the only allowed weight sync path; "
+            "no dense broadcast fallback."
+        ),
+    )
 
     # Async training using ray
     parser.add_argument("--async_train", action="store_true", default=False, help="Enable async training")
@@ -842,6 +855,23 @@ if __name__ == "__main__":
             args.n_samples_per_prompt * args.rollout_batch_size // args.micro_rollout_batch_size
             >= args.actor_num_nodes * args.actor_num_gpus_per_node // args.ring_attn_size // args.ds_tensor_parallel_size
         ), "The number of sample batches must be greater than or equal to the effective number of actor processes."
+
+    # Dynamic LoRA validations (strict policy when enabled)
+    if args.vllm_dynamic_lora:
+        if args.vllm_num_engines is None or args.vllm_num_engines <= 0:
+            raise RuntimeError(
+                "--vllm_dynamic_lora is enabled but --vllm_num_engines is not set (>0). "
+                "Configure vLLM engines or disable --vllm_dynamic_lora."
+            )
+        if args.lora_rank <= 0:
+            raise RuntimeError(
+                "--vllm_dynamic_lora requires LoRA to be enabled (set --lora_rank>0)."
+            )
+    elif args.lora_rank > 0 and (args.vllm_num_engines or 0) > 0:
+        print(
+            "[Warning] --lora_rank>0 but --vllm_dynamic_lora is disabled; "
+            "vLLM engines will continue using dense weight broadcasts until the new path is enabled."
+        )
 
     if args.use_ms:
         from modelscope.utils.hf_util import patch_hub

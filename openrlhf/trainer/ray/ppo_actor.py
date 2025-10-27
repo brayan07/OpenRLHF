@@ -2,7 +2,9 @@ import math
 import os
 import socket
 from abc import ABC
-from typing import Dict, List, Optional, Union
+import time
+from contextlib import nullcontext
+from typing import Any, Dict, List, Optional, Union
 
 import deepspeed
 import ray
@@ -22,12 +24,15 @@ from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, r
 from openrlhf.utils.distributed_util import stateless_init_process_group, torch_dist_barrier_and_cuda_sync
 from openrlhf.utils.logging_utils import init_logger
 
+from peft import get_peft_model_state_dict
+
 from ..ppo_utils import NaiveReplayBuffer
 
 logger = init_logger(__name__)
 
 from .launcher import BaseModelActor
 from .utils import get_physical_gpu_id
+from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
 
 
 class ActorPPOTrainer(ABC):
@@ -67,6 +72,11 @@ class ActorPPOTrainer(ABC):
         self.actor_scheduler = actor_scheduler
         self.vllm_engines = vllm_engines
         self.max_epochs = self.args.max_epochs
+
+        # Dynamic LoRA flags/state
+        self._use_dynamic_lora = bool(getattr(self.args, "vllm_dynamic_lora", False) and getattr(self.args, "lora_rank", 0) > 0)
+        self._last_lora_adapter_id: Optional[int] = None
+        self._lora_swap_seq: int = 0
 
         self.actor_loss_fn = PolicyLoss(
             clip_eps_low=self.args.eps_clip_low_high[0],
@@ -299,7 +309,76 @@ class ActorPPOTrainer(ABC):
                 status[k] = v.float().mean().item()
         return status
 
+    def _build_lora_payload(self, adapter_name: str) -> Dict[str, Any]:
+        """Build LoRA payload from the local actor model on CPU."""
+        if getattr(self.strategy.args, "lora_rank", 0) <= 0:
+            raise RuntimeError("LoRA is not enabled on the policy actor; cannot export adapter state.")
+
+        base_model = self.strategy._unwrap_model(self.actor)
+        if not hasattr(base_model, "peft_config") or not base_model.peft_config:
+            raise RuntimeError("Actor model does not carry PEFT configuration; expected LoRA-enabled PEFT model.")
+
+        # Use the first adapter's config as template
+        first_name = list(base_model.peft_config.keys())[0]
+        adapter_config = base_model.peft_config[first_name].to_dict()
+
+        zero_stage = getattr(self.strategy.args, "zero_stage", 0)
+        gather_ctx = (
+            deepspeed.zero.GatheredParameters(list(base_model.parameters()), enabled=True)
+            if zero_stage == 3
+            else nullcontext()
+        )
+
+        with gather_ctx:
+            state_dict = get_peft_model_state_dict(base_model, adapter_name=first_name)
+
+        tensors: Dict[str, torch.Tensor] = {}
+        for name, tensor in state_dict.items():
+            if not torch.is_tensor(tensor):
+                raise RuntimeError(f"Unexpected non-tensor entry '{name}' in LoRA state dict.")
+            tensors[name] = tensor.detach().to("cpu")
+
+        return {"adapter_name": adapter_name, "config": adapter_config, "tensors": tensors}
+
     def _broadcast_to_vllm(self):
+        # Dynamic LoRA path: push adapter payload instead of dense weights
+        if self._use_dynamic_lora:
+            # Rank 0 only orchestrates adapter swap
+            if torch.distributed.get_rank() == 0:
+                t0 = time.time()
+                # Build LoRA payload locally with a unique step-based adapter name
+                self._lora_swap_seq += 1
+                step_adapter_name = f"step-{self._lora_swap_seq}"
+                payload = self._build_lora_payload(step_adapter_name)
+                payload_ref = ray.put(payload)
+
+                # Optional: reset prefix cache prior to swap (async)
+                reset_refs = []
+                if getattr(self.strategy.args, "enable_prefix_caching", False):
+                    for engine in self.vllm_engines:
+                        reset_refs.append(engine.reset_prefix_cache.remote())
+
+                # Load new adapter across all engines
+                adapter_ids = batch_vllm_engine_call(self.vllm_engines, "load_lora_from_payload", payload_ref)
+                # Use first adapter_id as canonical (all engines derive same id from name)
+                new_adapter_id = int(adapter_ids[0]) if isinstance(adapter_ids, list) and adapter_ids else int(adapter_ids)
+
+                # Aggressively unload previous adapter after successful load
+                if self._last_lora_adapter_id is not None:
+                    batch_vllm_engine_call(self.vllm_engines, "unload_lora_adapter", self._last_lora_adapter_id)
+
+                self._last_lora_adapter_id = new_adapter_id
+                # Ensure cache reset completion if scheduled
+                if getattr(self.strategy.args, "enable_prefix_caching", False):
+                    ray.get(reset_refs)
+                logger.info(
+                    f"Dynamic LoRA: loaded adapter='{step_adapter_name}' id={new_adapter_id} across {len(self.vllm_engines)} engines in {time.time()-t0:.3f}s"
+                )
+
+            # sync ranks
+            torch_dist_barrier_and_cuda_sync()
+            return
+
         use_prefix_cache = getattr(self.strategy.args, "enable_prefix_caching", False)
         cache_reset_refs = []
         if use_prefix_cache and torch.distributed.get_rank() == 0:
@@ -568,3 +647,50 @@ class PolicyModelActor(BaseModelActor):
             )
         # wait
         torch_dist_barrier_and_cuda_sync()
+
+    def get_lora_state(self):
+        """Export the current LoRA adapter weights and config for dynamic vLLM loading."""
+
+        if getattr(self.strategy.args, "lora_rank", 0) <= 0:
+            raise RuntimeError("LoRA is not enabled on the policy actor; cannot export adapter state.")
+
+        base_model = self.strategy._unwrap_model(self.actor)
+
+        if not hasattr(base_model, "peft_config") or not base_model.peft_config:
+            raise RuntimeError("Actor model does not carry PEFT configuration; expected LoRA-enabled PEFT model.")
+
+        adapter_names = list(base_model.peft_config.keys())
+        if not adapter_names:
+            raise RuntimeError("No LoRA adapters found on the policy actor model.")
+        if len(adapter_names) > 1:
+            logger.warning(
+                "Multiple LoRA adapters detected on policy actor; exporting only the first adapter '%s'.",
+                adapter_names[0],
+            )
+
+        adapter_name = adapter_names[0]
+        adapter_config = base_model.peft_config[adapter_name].to_dict()
+
+        zero_stage = getattr(self.strategy.args, "zero_stage", 0)
+        gather_ctx = (
+            deepspeed.zero.GatheredParameters(list(base_model.parameters()), enabled=True)
+            if zero_stage == 3
+            else nullcontext()
+        )
+
+        with gather_ctx:
+            state_dict = get_peft_model_state_dict(base_model, adapter_name=adapter_name)
+
+        tensors: Dict[str, torch.Tensor] = {}
+        for name, tensor in state_dict.items():
+            if not torch.is_tensor(tensor):
+                raise RuntimeError(f"Unexpected non-tensor entry '{name}' in LoRA state dict.")
+            tensors[name] = tensor.detach().to("cpu")
+
+        payload = {
+            "adapter_name": adapter_name,
+            "config": adapter_config,
+            "tensors": tensors,
+        }
+
+        return ray.put(payload)

@@ -1,5 +1,14 @@
 import asyncio
 import os
+import json
+import tempfile
+from pathlib import Path
+import hashlib
+import time
+
+import torch
+from safetensors.torch import save_file as save_safetensors
+from vllm.lora.request import LoRARequest
 
 import ray
 
@@ -28,6 +37,8 @@ class LLMRayActorAsync(BaseLLMRayActor):
         engine_args = vllm.AsyncEngineArgs(*args, **self.kwargs)
         self.llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
         await self.llm.is_sleeping()
+        # Track adapter metadata locally for logging/metrics
+        self._lora_registry: dict[int, dict] = {}
 
     async def init_process_group(
         self, master_address, master_port, rank_offset, world_size, group_name, backend, use_ray
@@ -53,6 +64,67 @@ class LLMRayActorAsync(BaseLLMRayActor):
 
     async def wake_up(self):
         await self.llm.wake_up()
+
+    # Dynamic LoRA helpers (async)
+    def _adapter_id_from_name(self, adapter_name: str) -> int:
+        digest = hashlib.sha1(adapter_name.encode("utf-8")).hexdigest()
+        val = int(digest[:8], 16) & 0x7FFFFFFF
+        return val or 1
+
+    async def load_lora_from_payload(self, payload_ref) -> int:
+        # Resolve Ray object ref if provided
+        payload = ray.get(payload_ref) if isinstance(payload_ref, ray.ObjectRef) else payload_ref
+        if not isinstance(payload, dict):
+            raise TypeError("LoRA payload must be a dict with keys: adapter_name, config, tensors")
+
+        adapter_name = payload.get("adapter_name") or "adapter"
+        adapter_id = self._adapter_id_from_name(adapter_name)
+        config = payload.get("config")
+        tensors = payload.get("tensors")
+
+        if not isinstance(config, dict) or not isinstance(tensors, dict) or not tensors:
+            raise RuntimeError("Invalid LoRA payload: missing or malformed 'config'/'tensors'.")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+
+            cpu_tensors = {}
+            for name, t in tensors.items():
+                if not isinstance(t, torch.Tensor):
+                    raise RuntimeError(f"LoRA tensor '{name}' is not a torch.Tensor")
+                cpu_tensors[name] = t.detach().to("cpu")
+
+            save_safetensors(cpu_tensors, str(tmp_path / "adapter_model.safetensors"))
+
+            req = LoRARequest(lora_name=adapter_name, lora_int_id=adapter_id, lora_path=str(tmp_path))
+            ok = await self.llm.add_lora(req)
+            # v0 returns None (no failure), v1 returns bool
+            if ok is False:
+                raise RuntimeError(f"vLLM failed to add LoRA adapter '{adapter_name}' (id={adapter_id}).")
+
+        # Record metadata for logging/metrics
+        self._lora_registry[adapter_id] = {
+            "name": adapter_name,
+            "loaded_at_ts": time.time(),
+        }
+
+        return adapter_id
+
+    async def unload_lora_adapter(self, adapter_id: int) -> bool:
+        if not isinstance(adapter_id, int) or adapter_id <= 0:
+            raise ValueError("adapter_id must be a positive int")
+        ok = await self.llm.remove_lora(adapter_id)
+        if ok is not False:
+            self._lora_registry.pop(adapter_id, None)
+        return bool(ok) if isinstance(ok, bool) else True
+
+    async def list_lora_adapters(self) -> list[int]:
+        adapters = await self.llm.list_loras()
+        return list(adapters)
+
+    async def get_lora_registry(self) -> dict[int, dict]:
+        return dict(self._lora_registry)
 
     async def add_requests(self, sampling_params, prompts, labels, max_length, hf_tokenizer=None, max_steps=10000):
         """

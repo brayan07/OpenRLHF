@@ -1,6 +1,15 @@
 import os
 import queue
+import json
+import tempfile
+from pathlib import Path
 from typing import Any, List
+import hashlib
+
+import torch
+from safetensors.torch import save_file as save_safetensors
+from vllm.lora.request import LoRARequest
+import time
 
 import ray
 from ray.util.placement_group import placement_group
@@ -11,6 +20,79 @@ from openrlhf.utils.logging_utils import init_logger
 from .utils import get_bundle_indices, ray_noset_visible_devices
 
 logger = init_logger(__name__)
+
+
+def adapter_id_from_name(adapter_name: str) -> int:
+    """Stable positive 31-bit ID derived from adapter name."""
+    digest = hashlib.sha1(adapter_name.encode("utf-8")).hexdigest()
+    val = int(digest[:8], 16) & 0x7FFFFFFF
+    return val or 1
+
+
+def load_lora_from_payload_local(llm_engine, payload: dict, registry: dict | None = None) -> int:
+    """Core LoRA loader that operates on a provided llm_engine.
+
+    - Writes adapter payload to a temp dir
+    - Calls llm_engine.add_lora(LoRARequest)
+    - Updates optional registry with metadata
+    Returns adapter_id
+    """
+    if not isinstance(payload, dict):
+        raise TypeError("LoRA payload must be a dict with keys: adapter_name, config, tensors")
+
+    adapter_name = payload.get("adapter_name") or "adapter"
+    adapter_id = adapter_id_from_name(adapter_name)
+    config = payload.get("config")
+    tensors = payload.get("tensors")
+
+    if not isinstance(config, dict) or not isinstance(tensors, dict) or not tensors:
+        raise RuntimeError("Invalid LoRA payload: missing or malformed 'config'/'tensors'.")
+
+    def _json_safe(o):
+        if isinstance(o, set):
+            return list(o)
+        if isinstance(o, tuple):
+            return list(o)
+        if isinstance(o, dict):
+            return {k: _json_safe(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [ _json_safe(v) for v in o ]
+        try:
+            json.dumps(o)
+            return o
+        except TypeError:
+            return str(o)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        (tmp_path / "adapter_config.json").write_text(json.dumps(_json_safe(config)))
+
+        cpu_tensors = {}
+        for name, t in tensors.items():
+            if not isinstance(t, torch.Tensor):
+                raise RuntimeError(f"LoRA tensor '{name}' is not a torch.Tensor")
+            cpu_tensors[name] = t.detach().to("cpu")
+
+        save_safetensors(cpu_tensors, str(tmp_path / "adapter_model.safetensors"))
+
+        req = LoRARequest(lora_name=adapter_name, lora_int_id=adapter_id, lora_path=str(tmp_path))
+        ok = llm_engine.add_lora(req)
+        if not ok:
+            raise RuntimeError(f"vLLM failed to add LoRA adapter '{adapter_name}' (id={adapter_id}).")
+
+    if registry is not None:
+        registry[adapter_id] = {"name": adapter_name, "loaded_at_ts": time.time()}
+
+    return adapter_id
+
+
+def unload_lora_adapter_local(llm_engine, adapter_id: int, registry: dict | None = None) -> bool:
+    if not isinstance(adapter_id, int) or adapter_id <= 0:
+        raise ValueError("adapter_id must be a positive int")
+    ok = llm_engine.remove_lora(adapter_id)
+    if ok is not False and registry is not None:
+        registry.pop(adapter_id, None)
+    return bool(ok) if isinstance(ok, bool) else True
 
 
 @ray.remote
@@ -69,6 +151,8 @@ class LLMRayActor(BaseLLMRayActor):
         import vllm
 
         self.llm = vllm.LLM(*args, **self.kwargs)
+        # Track adapter metadata locally for logging/metrics
+        self._lora_registry: dict[int, dict] = {}
 
     def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend, use_ray):
         return self.llm.collective_rpc(
@@ -108,6 +192,30 @@ class LLMRayActor(BaseLLMRayActor):
         """
         return self.response_queues.get()
 
+    # Dynamic LoRA helpers
+    def _adapter_id_from_name(self, adapter_name: str) -> int:
+        return adapter_id_from_name(adapter_name)
+
+    def load_lora_from_payload(self, payload_ref) -> int:
+        """Load a LoRA adapter into vLLM from a Ray payload.
+
+        Payload schema: {"adapter_name": str, "config": dict, "tensors": dict[str, torch.Tensor]}
+        Returns: adapter_id (int)
+        """
+        payload = ray.get(payload_ref) if isinstance(payload_ref, ray.ObjectRef) else payload_ref
+        return load_lora_from_payload_local(self.llm.llm_engine, payload, registry=self._lora_registry)
+
+    def unload_lora_adapter(self, adapter_id: int) -> bool:
+        return unload_lora_adapter_local(self.llm.llm_engine, adapter_id, registry=self._lora_registry)
+
+    def list_lora_adapters(self) -> list[int]:
+        # vLLM returns a set[int]
+        return list(self.llm.llm_engine.list_loras())
+
+    def get_lora_registry(self) -> dict[int, dict]:
+        # Return a shallow copy to avoid external mutation
+        return dict(self._lora_registry)
+
 
 def create_vllm_engines(
     num_engines: int,
@@ -124,6 +232,13 @@ def create_vllm_engines(
     llm_actor_cls=LLMRayActor,
     logprobs_mode=None,
     agent_func_path=None,
+    # LoRA-related options
+    dtype: str = "bfloat16",
+    enable_lora: bool = False,
+    max_lora_rank: int | None = None,
+    lora_dtype: str | None = None,
+    max_loras: int | None = None,
+    enable_lora_bias: bool | None = None,
 ):
     import vllm
     from packaging import version
@@ -178,7 +293,7 @@ def create_vllm_engines(
                 distributed_executor_backend=distributed_executor_backend,
                 max_model_len=max_model_len,
                 enable_prefix_caching=enable_prefix_caching,
-                dtype="bfloat16",
+                dtype=dtype,
                 trust_remote_code=True,
                 full_determinism=full_determinism,
                 gpu_memory_utilization=gpu_memory_utilization,
@@ -186,6 +301,12 @@ def create_vllm_engines(
                 num_gpus=0.5 if use_hybrid_engine else 1,
                 enable_sleep_mode=vllm_enable_sleep,
                 agent_func_path=agent_func_path,
+                # LoRA
+                enable_lora=enable_lora,
+                **({"max_lora_rank": max_lora_rank} if max_lora_rank is not None else {}),
+                **({"lora_dtype": lora_dtype} if lora_dtype is not None else {}),
+                **({"max_loras": max_loras} if max_loras is not None else {}),
+                **({"enable_lora_bias": enable_lora_bias} if enable_lora_bias is not None else {}),
                 **additional_kwargs,
             )
         )
