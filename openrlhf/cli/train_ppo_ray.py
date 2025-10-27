@@ -93,12 +93,12 @@ def train(args):
             "processed_logprobs" if args.enable_vllm_is_correction else None,
             args.agent_func_path,
         )
+        # Optionally start a detached arc-agi SubmissionActor to periodically write submission.json
+        get_or_create_submission_actor(args, pg=pg)
+
         # Optionally start a detached arc-agi CurriculumController actor so that
         # AgentExecutor in arc-agi can resolve it via ray.get_actor(name).
         get_or_create_curriculum_controller(args, pg=pg)
-
-        # Optionally start a detached arc-agi SubmissionActor to periodically write submission.json
-        get_or_create_submission_actor(args, pg=pg)
 
     # In inference-only mode, skip all training model initialization
     if args.inference_only:
