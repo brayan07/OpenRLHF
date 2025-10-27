@@ -453,8 +453,13 @@ class BasePPOTrainer(ABC):
         max_prompts = ray.get(
             controller.get_max_prompts.remote()
         )
-        self.max_steps = max_prompts // (
-            args.vllm_generate_batch_size if args.vllm_generate_batch_size is not None else args.rollout_batch_size)
+        self.max_steps = (
+                max_prompts
+                * args.n_samples_per_prompt
+                // args.train_batch_size
+                * args.num_episodes
+                * args.max_epochs
+        )
 
         self.prompts_dataloader = prompts_dataloader
         self.eval_dataloader = eval_dataloader
@@ -582,6 +587,9 @@ class PPOTrainer(BasePPOTrainer):
                     0
                 ]
                 logger.info(f"checkpoint_states: {checkpoint_states}")
+                if getattr(args, "deepspeed_enable_sleep", False):
+                    print("Offloading actor states before broadcast to vLLM.")
+                    ray.get(self.actor_model_group.async_run_method(method_name="offload_states"))
                 self._broadcast_to_vllm()
             else:
                 checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}, "controller_state": {}}
