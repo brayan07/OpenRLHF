@@ -10,38 +10,22 @@ from openrlhf.trainer.ppo_utils.experience_maker import Experience
 
 @ray.remote
 class ExperienceDiskLogger:
-    def __init__(self, out_dir: str, write_jsonl: bool = False):
+    def __init__(self, out_dir: str):
         self.out_dir = out_dir
         os.makedirs(self.out_dir, exist_ok=True)
-        self.write_jsonl = write_jsonl
-        self._jsonl_files = {}
 
-    def _save_pt(self, kind: str, step: int, records):
+    def _save_pt(self, kind: str, step: int, records, mode="train"):
         """Save a list of per-item dicts with tensors/lists using torch.save.
         No additional batching; preserves original grouping.
         """
-        fn = os.path.join(self.out_dir, f"{kind}_step{step:06d}.pt")
+        fn = os.path.join(self.out_dir, f"{kind}_{mode}_step{step:06d}.pt")
         torch.save(records, fn)
 
-    def _append_jsonl(self, kind: str, jsonl_records):
-        if not self.write_jsonl or not jsonl_records:
-            return
-        if kind not in self._jsonl_files:
-            self._jsonl_files[kind] = open(
-                os.path.join(self.out_dir, f"{kind}.jsonl"), "a", encoding="utf-8"
-            )
-        fh = self._jsonl_files[kind]
-        for r in jsonl_records:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-        fh.flush()
+    def log_rollouts(self, step: int, records, mode="train"):
+        self._save_pt("rollouts", step, records, mode=mode)
 
-    def log_rollouts(self, step: int, records, jsonl_records=None):
-        self._save_pt("rollouts", step, records)
-        self._append_jsonl("rollouts", jsonl_records)
-
-    def log_experiences(self, step: int, records, jsonl_records=None):
-        self._save_pt("experiences", step, records)
-        self._append_jsonl("experiences", jsonl_records)
+    def log_experiences(self, step: int, records, mode="train"):
+        self._save_pt("experiences", step, records, mode=mode)
 
 
 # -------- Inspection utilities --------

@@ -474,6 +474,7 @@ class PolicyModelActor(BaseModelActor):
             self.checkpoint_states["global_step"] = states["global_step"]
             self.checkpoint_states["episode"] = states["episode"]
             self.checkpoint_states["data_loader_state_dict"] = states["data_loader_state_dict"]
+            self.checkpoint_states["controller_state"] = states["controller_state"]
 
         # initial offload
         if strategy.args.deepspeed_enable_sleep:
