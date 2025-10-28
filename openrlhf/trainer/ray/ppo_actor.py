@@ -310,46 +310,79 @@ class ActorPPOTrainer(ABC):
         return status
 
     def _build_lora_payload(self, adapter_name: str) -> Dict[str, Any]:
-        """Build LoRA payload from the local actor model on CPU."""
+        """Build LoRA payload from the local actor model on CPU.
+        
+        Under ZeRO-3, all ranks must call this to participate in gather collectives,
+        but only rank 0 will export tensors and return a payload.
+        """
         if getattr(self.strategy.args, "lora_rank", 0) <= 0:
             raise RuntimeError("LoRA is not enabled on the policy actor; cannot export adapter state.")
-
-        base_model = self.strategy._unwrap_model(self.actor)
+        torch.cuda.empty_cache()
+        base_model = self.actor.model.module
         if not hasattr(base_model, "peft_config") or not base_model.peft_config:
             raise RuntimeError("Actor model does not carry PEFT configuration; expected LoRA-enabled PEFT model.")
 
         # Use the first adapter's config as template
         first_name = list(base_model.peft_config.keys())[0]
         adapter_config = base_model.peft_config[first_name].to_dict()
+        bias_mode = getattr(base_model.peft_config[first_name], "bias", "none")
+        if bias_mode == "all":
+            raise RuntimeError("LoRA bias='all' is not supported for dynamic adapter export under ZeRO-3.")
 
+        # Stream export: gather each required tensor individually and put to object store
         zero_stage = getattr(self.strategy.args, "zero_stage", 0)
-        gather_ctx = (
-            deepspeed.zero.GatheredParameters(list(base_model.parameters()), enabled=True)
-            if zero_stage == 3
-            else nullcontext()
-        )
+        name_to_param = dict(base_model.named_parameters())
+        # LoRA params for the selected adapter
+        lora_param_names = [
+            n for n in name_to_param.keys() if "lora_" in n and first_name in n
+        ]
+        # Optional bias for lora_only
+        bias_names: list[str] = []
+        if bias_mode == "lora_only":
+            prefixes = {n.split("lora_")[0] for n in lora_param_names}
+            bias_names = [p + "bias" for p in prefixes if (p + "bias") in name_to_param]
 
-        with gather_ctx:
-            state_dict = get_peft_model_state_dict(base_model, adapter_name=first_name)
+        param_names = list(dict.fromkeys(lora_param_names + bias_names))  # preserve order, de-dup
+        if not param_names:
+            raise RuntimeError("No LoRA parameters found to export.")
 
-        tensors: Dict[str, torch.Tensor] = {}
-        for name, tensor in state_dict.items():
-            if not torch.is_tensor(tensor):
-                raise RuntimeError(f"Unexpected non-tensor entry '{name}' in LoRA state dict.")
-            tensors[name] = tensor.detach().to("cpu")
+        is_rank0 = torch.distributed.get_rank() == 0
+        tensor_refs: Dict[str, ray.ObjectRef] = {}
+        total_params = len(param_names)
+        pbar = tqdm(param_names, desc="Exporting LoRA tensors", total=total_params, disable=not is_rank0)
+        for pname in pbar:
+            p = name_to_param[pname]
+            # All ranks participate in gather collective under ZeRO-3
+            if zero_stage == 3:
+                with deepspeed.zero.GatheredParameters([p], enabled=True, modifier_rank=0):
+                    # Only rank 0 exports to CPU and object store
+                    if is_rank0:
+                        t_cpu = p.detach().to("cpu")
+                        tensor_refs[pname] = ray.put(t_cpu)
+            else:
+                # No gather needed; only rank 0 exports
+                if is_rank0:
+                    t_cpu = p.detach().to("cpu")
+                    tensor_refs[pname] = ray.put(t_cpu)
 
-        return {"adapter_name": adapter_name, "config": adapter_config, "tensors": tensors}
+        # Only rank 0 returns the payload; other ranks return None
+        if is_rank0:
+            return {"adapter_name": adapter_name, "config": adapter_config, "tensor_refs": tensor_refs}
+        else:
+            return None
 
     def _broadcast_to_vllm(self):
         # Dynamic LoRA path: push adapter payload instead of dense weights
         if self._use_dynamic_lora:
-            # Rank 0 only orchestrates adapter swap
+            t0 = time.time()
+            # All ranks must call _build_lora_payload to participate in ZeRO-3 gather collectives
+            self._lora_swap_seq += 1
+            step_adapter_name = f"step-{self._lora_swap_seq}"
+            payload = self._build_lora_payload(step_adapter_name)
+            
+            # Only rank 0 orchestrates vLLM adapter swap
             if torch.distributed.get_rank() == 0:
-                t0 = time.time()
-                # Build LoRA payload locally with a unique step-based adapter name
-                self._lora_swap_seq += 1
-                step_adapter_name = f"step-{self._lora_swap_seq}"
-                payload = self._build_lora_payload(step_adapter_name)
+                print("Putting lora pyload in object store")
                 payload_ref = ray.put(payload)
 
                 # Optional: reset prefix cache prior to swap (async)
@@ -359,16 +392,20 @@ class ActorPPOTrainer(ABC):
                         reset_refs.append(engine.reset_prefix_cache.remote())
 
                 # Load new adapter across all engines
+                print("Loading lora payload in vLLM")
                 adapter_ids = batch_vllm_engine_call(self.vllm_engines, "load_lora_from_payload", payload_ref)
                 # Use first adapter_id as canonical (all engines derive same id from name)
+                print("Adapter id: ", adapter_ids)
                 new_adapter_id = int(adapter_ids[0]) if isinstance(adapter_ids, list) and adapter_ids else int(adapter_ids)
 
                 # Aggressively unload previous adapter after successful load
                 if self._last_lora_adapter_id is not None:
+                    print("Unloading previous adapter")
                     batch_vllm_engine_call(self.vllm_engines, "unload_lora_adapter", self._last_lora_adapter_id)
 
                 self._last_lora_adapter_id = new_adapter_id
                 # Ensure cache reset completion if scheduled
+                print("Waiting for cache reset")
                 if getattr(self.strategy.args, "enable_prefix_caching", False):
                     ray.get(reset_refs)
                 logger.info(
@@ -376,6 +413,7 @@ class ActorPPOTrainer(ABC):
                 )
 
             # sync ranks
+            print("Syncing ranks")
             torch_dist_barrier_and_cuda_sync()
             return
 
@@ -544,6 +582,60 @@ class PolicyModelActor(BaseModelActor):
         else:
             self.ema_model = None
 
+        # Verify only LoRA params are trainable and report counts
+        is_dist0 = (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_rank() == 0
+        )
+        try:
+            base_model = self.strategy._unwrap_model(self.actor)
+        except Exception:
+            base_model = None
+        if is_dist0 and base_model is not None:
+            # Print PEFT summary if available
+            if hasattr(base_model, "print_trainable_parameters"):
+                base_model.print_trainable_parameters()
+
+            total_params = 0
+            trainable_params = 0
+            offenders: list[str] = []
+
+            # Allow-list
+            modules_to_save = set(getattr(self.strategy.args, "modules_to_save", []) or [])
+            adapter_names = list(getattr(base_model, "peft_config", {}).keys()) if hasattr(base_model, "peft_config") else []
+            bias_mode = None
+            if adapter_names:
+                bias_mode = getattr(base_model.peft_config[adapter_names[0]], "bias", "none")
+
+            def _numel(param: torch.nn.Parameter) -> int:
+                # Under ZeRO-3, param.numel() can be 0 for partitioned placeholders; prefer ds_numel if present
+                return int(getattr(param, "ds_numel", param.numel()))
+
+            for name, p in base_model.named_parameters():
+                n = _numel(p)
+                total_params += n
+                if p.requires_grad:
+                    trainable_params += n
+                    is_lora = ("lora_" in name) or ("lora_magnitude_vector" in name)  # DoRA vector
+                    is_saved_mod = any(m in name for m in modules_to_save)
+                    is_allowed_bias = (bias_mode == "lora_only" and name.endswith(".bias"))
+                    if not (is_lora or is_saved_mod or is_allowed_bias):
+                        offenders.append(name)
+
+            pct = (100.0 * trainable_params / max(1, total_params))
+            logger.info(
+                f"Params: total={total_params:,} trainable={trainable_params:,} ({pct:.4f}%)"
+            )
+            if offenders:
+                # Fail-fast per project guidelines
+                sample = offenders[:10]
+                more = " ..." if len(offenders) > 10 else ""
+                raise RuntimeError(
+                    f"Found non-LoRA trainable parameters: {sample}{more}. "
+                    f"If intended, add them to modules_to_save or adjust LoRA config."
+                )
+
         # load checkpoint
         self.checkpoint_states = {}
         ckpt_path = os.path.join(args.ckpt_path, "_actor")
@@ -670,27 +762,32 @@ class PolicyModelActor(BaseModelActor):
 
         adapter_name = adapter_names[0]
         adapter_config = base_model.peft_config[adapter_name].to_dict()
+        bias_mode = getattr(base_model.peft_config[adapter_name], "bias", "none")
+        if bias_mode == "all":
+            raise RuntimeError("LoRA bias='all' is not supported for dynamic adapter export under ZeRO-3.")
 
+        # Stream export: gather each required tensor individually and put to object store
         zero_stage = getattr(self.strategy.args, "zero_stage", 0)
-        gather_ctx = (
-            deepspeed.zero.GatheredParameters(list(base_model.parameters()), enabled=True)
-            if zero_stage == 3
-            else nullcontext()
-        )
+        name_to_param = dict(base_model.named_parameters())
+        lora_param_names = [n for n in name_to_param.keys() if "lora_" in n and adapter_name in n]
+        bias_names: list[str] = []
+        if bias_mode == "lora_only":
+            prefixes = {n.split("lora_")[0] for n in lora_param_names}
+            bias_names = [p + "bias" for p in prefixes if (p + "bias") in name_to_param]
 
-        with gather_ctx:
-            state_dict = get_peft_model_state_dict(base_model, adapter_name=adapter_name)
+        param_names = list(dict.fromkeys(lora_param_names + bias_names))
+        if not param_names:
+            raise RuntimeError("No LoRA parameters found to export.")
 
-        tensors: Dict[str, torch.Tensor] = {}
-        for name, tensor in state_dict.items():
-            if not torch.is_tensor(tensor):
-                raise RuntimeError(f"Unexpected non-tensor entry '{name}' in LoRA state dict.")
-            tensors[name] = tensor.detach().to("cpu")
+        tensor_refs: Dict[str, ray.ObjectRef] = {}
+        for pname in param_names:
+            p = name_to_param[pname]
+            if zero_stage == 3:
+                with deepspeed.zero.GatheredParameters([p], enabled=True, modifier_rank=0):
+                    t_cpu = p.detach().to("cpu")
+            else:
+                t_cpu = p.detach().to("cpu")
+            tensor_refs[pname] = ray.put(t_cpu)
 
-        payload = {
-            "adapter_name": adapter_name,
-            "config": adapter_config,
-            "tensors": tensors,
-        }
-
+        payload = {"adapter_name": adapter_name, "config": adapter_config, "tensor_refs": tensor_refs}
         return ray.put(payload)

@@ -79,6 +79,12 @@ def train(args):
         else:
             from openrlhf.trainer.ray.vllm_engine import LLMRayActor
 
+        # Determine LoRA settings for vLLM engines
+        enable_lora = getattr(args, "vllm_dynamic_lora", False) and getattr(args, "lora_rank", 0) > 0
+        max_lora_rank = getattr(args, "lora_rank", 8) if enable_lora else None
+        lora_dtype = "bfloat16" if enable_lora else None
+        max_loras = 8 if enable_lora else None
+        
         vllm_engines = create_vllm_engines(
             args.vllm_num_engines,
             args.vllm_tensor_parallel_size,
@@ -94,6 +100,11 @@ def train(args):
             LLMRayActor,
             "processed_logprobs" if args.enable_vllm_is_correction else None,
             args.agent_func_path,
+            # LoRA parameters for dynamic adapter loading
+            enable_lora=enable_lora,
+            max_lora_rank=max_lora_rank,
+            lora_dtype=lora_dtype,
+            max_loras=max_loras,
         )
         # Optionally start a detached arc-agi SubmissionActor to periodically write submission.json
         get_or_create_submission_actor(args, pg=pg)

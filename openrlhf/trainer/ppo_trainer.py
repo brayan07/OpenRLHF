@@ -580,6 +580,7 @@ class PPOTrainer(BasePPOTrainer):
         inference_only = getattr(args, "inference_only", False)
 
         # broadcast init checkpoint to vllm (skip in inference-only mode)
+        reloaded_from_checkpoint = False
         if not inference_only:
             ckpt_path = os.path.join(args.ckpt_path, "_actor")
             if args.load_checkpoint and os.path.exists(ckpt_path):
@@ -591,10 +592,15 @@ class PPOTrainer(BasePPOTrainer):
                     print("Offloading actor states before broadcast to vLLM.")
                     ray.get(self.actor_model_group.async_run_method(method_name="offload_states"))
                 self._broadcast_to_vllm()
+                reloaded_from_checkpoint = True
             else:
                 checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}, "controller_state": {}}
         else:
             checkpoint_states = {"global_step": 0, "episode": 0, "data_loader_state_dict": {}, "controller_state": {}}
+
+        # If we're using Lora, we must apply adapter
+        if getattr(args, "lora_rank", 0) > 0 and not reloaded_from_checkpoint:
+            self._broadcast_to_vllm()
 
         # If specified eval before training, evaluate
         if getattr(args, "eval_upon_start", None):

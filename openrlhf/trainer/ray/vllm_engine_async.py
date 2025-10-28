@@ -75,25 +75,66 @@ class LLMRayActorAsync(BaseLLMRayActor):
         # Resolve Ray object ref if provided
         payload = ray.get(payload_ref) if isinstance(payload_ref, ray.ObjectRef) else payload_ref
         if not isinstance(payload, dict):
-            raise TypeError("LoRA payload must be a dict with keys: adapter_name, config, tensors")
+            raise TypeError("LoRA payload must be a dict with keys: adapter_name, config, tensors|tensor_refs")
 
         adapter_name = payload.get("adapter_name") or "adapter"
         adapter_id = self._adapter_id_from_name(adapter_name)
         config = payload.get("config")
         tensors = payload.get("tensors")
+        tensor_refs = payload.get("tensor_refs")
 
-        if not isinstance(config, dict) or not isinstance(tensors, dict) or not tensors:
-            raise RuntimeError("Invalid LoRA payload: missing or malformed 'config'/'tensors'.")
+        if not isinstance(config, dict):
+            raise RuntimeError("Invalid LoRA payload: missing or malformed 'config'.")
+        if tensors is None and tensor_refs is None:
+            raise RuntimeError("Invalid LoRA payload: expected 'tensors' or 'tensor_refs'.")
+        if isinstance(tensors, dict) and len(tensors) == 0:
+            raise RuntimeError("Invalid LoRA payload: 'tensors' must be a non-empty dict.")
+        if isinstance(tensor_refs, dict) and len(tensor_refs) == 0:
+            raise RuntimeError("Invalid LoRA payload: 'tensor_refs' must be a non-empty dict.")
+
+        def _json_safe(o):
+            if isinstance(o, set):
+                return list(o)
+            if isinstance(o, tuple):
+                return list(o)
+            if isinstance(o, dict):
+                return {k: _json_safe(v) for k, v in o.items()}
+            if isinstance(o, list):
+                return [_json_safe(v) for v in o]
+            try:
+                json.dumps(o)
+                return o
+            except TypeError:
+                return str(o)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+            (tmp_path / "adapter_config.json").write_text(json.dumps(_json_safe(config)))
 
             cpu_tensors = {}
-            for name, t in tensors.items():
-                if not isinstance(t, torch.Tensor):
-                    raise RuntimeError(f"LoRA tensor '{name}' is not a torch.Tensor")
-                cpu_tensors[name] = t.detach().to("cpu")
+            if isinstance(tensors, dict):
+                for name, t in tensors.items():
+                    if not isinstance(t, torch.Tensor):
+                        raise RuntimeError(f"LoRA tensor '{name}' is not a torch.Tensor")
+                    cpu_tensors[name] = t.detach().to("cpu")
+            elif isinstance(tensor_refs, dict):
+                for name, ref in tensor_refs.items():
+                    if not isinstance(ref, ray.ObjectRef):
+                        raise RuntimeError(
+                            f"LoRA tensor ref '{name}' has invalid type {type(ref)}; expected ray.ObjectRef"
+                        )
+                    try:
+                        t = ray.get(ref)
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to resolve tensor ref '{name}': {e}")
+                    if not isinstance(t, torch.Tensor):
+                        raise RuntimeError(f"LoRA tensor ref '{name}' did not resolve to torch.Tensor")
+                    cpu_tensors[name] = t.detach().to("cpu")
+            else:
+                raise RuntimeError("Invalid LoRA payload: tensors must be dict or provide tensor_refs dict.")
+
+            if not cpu_tensors:
+                raise RuntimeError("Invalid LoRA payload: no tensors to save.")
 
             save_safetensors(cpu_tensors, str(tmp_path / "adapter_model.safetensors"))
 

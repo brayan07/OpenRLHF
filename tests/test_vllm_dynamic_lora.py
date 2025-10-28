@@ -3,6 +3,7 @@ import json
 import pytest
 import torch
 from safetensors.torch import load_file as load_safetensors
+import ray
 
 from openrlhf.trainer.ray.vllm_engine import (
     load_lora_from_payload_local,
@@ -75,6 +76,35 @@ def test_load_and_unload_roundtrip():
     assert adapter_id not in registry
 
 
+def test_load_with_tensor_refs_roundtrip():
+    # Ensure Ray is running
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True, include_dashboard=False, num_cpus=1)
+    engine, registry = build_fake_engine_and_registry()
+
+    adapter_name = "step-refs"
+    cfg = {"r": 8, "alpha": 16, "target_modules": ["q_proj", "v_proj"], "lora_dropout": 0.0}
+    # Put tensors individually into Ray object store
+    refs = {
+        "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": ray.put(torch.zeros(4, 8)),
+        "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": ray.put(torch.zeros(8, 4)),
+    }
+    payload = {"adapter_name": adapter_name, "config": cfg, "tensor_refs": refs}
+
+    adapter_id = load_lora_from_payload_local(engine, payload, registry)
+    assert adapter_id in engine.loaded_ids
+    assert adapter_id in registry and registry[adapter_id]["name"] == adapter_name
+
+    # Unload cleans up engine and registry
+    ok = unload_lora_adapter_local(engine, adapter_id, registry)
+    assert ok is True
+    assert adapter_id not in engine.loaded_ids
+    assert adapter_id not in registry
+    # Shutdown Ray if we started it
+    if ray.is_initialized():
+        ray.shutdown()
+
+
 def test_adapter_id_determinism():
     id1 = adapter_id_from_name("step-42")
     id2 = adapter_id_from_name("step-42")
@@ -92,6 +122,8 @@ def test_adapter_id_determinism():
         {"adapter_name": "a", "config": {}},
         {"adapter_name": "a", "config": {}, "tensors": {}},
         {"adapter_name": "a", "config": {}, "tensors": {"k": "not-a-tensor"}},
+        {"adapter_name": "a", "config": {}, "tensor_refs": {}},
+        {"adapter_name": "a", "config": {}, "tensor_refs": {"k": "not-a-ref"}},
     ],
 )
 def test_invalid_payload_errors(bad_payload):

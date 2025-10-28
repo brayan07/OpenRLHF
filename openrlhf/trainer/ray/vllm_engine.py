@@ -32,6 +32,9 @@ def adapter_id_from_name(adapter_name: str) -> int:
 def load_lora_from_payload_local(llm_engine, payload: dict, registry: dict | None = None) -> int:
     """Core LoRA loader that operates on a provided llm_engine.
 
+    - Accepts payload with either:
+      - tensors: dict[str, torch.Tensor]
+      - tensor_refs: dict[str, ray.ObjectRef]
     - Writes adapter payload to a temp dir
     - Calls llm_engine.add_lora(LoRARequest)
     - Updates optional registry with metadata
@@ -44,9 +47,16 @@ def load_lora_from_payload_local(llm_engine, payload: dict, registry: dict | Non
     adapter_id = adapter_id_from_name(adapter_name)
     config = payload.get("config")
     tensors = payload.get("tensors")
+    tensor_refs = payload.get("tensor_refs")
 
-    if not isinstance(config, dict) or not isinstance(tensors, dict) or not tensors:
-        raise RuntimeError("Invalid LoRA payload: missing or malformed 'config'/'tensors'.")
+    if not isinstance(config, dict):
+        raise RuntimeError("Invalid LoRA payload: missing or malformed 'config'.")
+    if tensors is None and tensor_refs is None:
+        raise RuntimeError("Invalid LoRA payload: expected 'tensors' or 'tensor_refs'.")
+    if isinstance(tensors, dict) and len(tensors) == 0:
+        raise RuntimeError("Invalid LoRA payload: 'tensors' must be a non-empty dict.")
+    if isinstance(tensor_refs, dict) and len(tensor_refs) == 0:
+        raise RuntimeError("Invalid LoRA payload: 'tensor_refs' must be a non-empty dict.")
 
     def _json_safe(o):
         if isinstance(o, set):
@@ -68,10 +78,29 @@ def load_lora_from_payload_local(llm_engine, payload: dict, registry: dict | Non
         (tmp_path / "adapter_config.json").write_text(json.dumps(_json_safe(config)))
 
         cpu_tensors = {}
-        for name, t in tensors.items():
-            if not isinstance(t, torch.Tensor):
-                raise RuntimeError(f"LoRA tensor '{name}' is not a torch.Tensor")
-            cpu_tensors[name] = t.detach().to("cpu")
+        if isinstance(tensors, dict):
+            for name, t in tensors.items():
+                if not isinstance(t, torch.Tensor):
+                    raise RuntimeError(f"LoRA tensor '{name}' is not a torch.Tensor")
+                cpu_tensors[name] = t.detach().to("cpu")
+        elif isinstance(tensor_refs, dict):
+            for name, ref in tensor_refs.items():
+                if not isinstance(ref, ray.ObjectRef):
+                    raise RuntimeError(
+                        f"LoRA tensor ref '{name}' has invalid type {type(ref)}; expected ray.ObjectRef"
+                    )
+                try:
+                    t = ray.get(ref)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to resolve tensor ref '{name}': {e}")
+                if not isinstance(t, torch.Tensor):
+                    raise RuntimeError(f"LoRA tensor ref '{name}' did not resolve to torch.Tensor")
+                cpu_tensors[name] = t.detach().to("cpu")
+        else:
+            raise RuntimeError("Invalid LoRA payload: tensors must be dict or provide tensor_refs dict.")
+
+        if not cpu_tensors:
+            raise RuntimeError("Invalid LoRA payload: no tensors to save.")
 
         save_safetensors(cpu_tensors, str(tmp_path / "adapter_model.safetensors"))
 
@@ -284,6 +313,11 @@ def create_vllm_engines(
                 num_cpus=num_gpus,
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
+                runtime_env={
+                    "env_vars": {
+                        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "1",
+                    }
+                },
             ).remote(
                 model=pretrain,
                 enforce_eager=enforce_eager,
