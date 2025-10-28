@@ -358,12 +358,17 @@ class ActorPPOTrainer(ABC):
                     # Only rank 0 exports to CPU and object store
                     if is_rank0:
                         t_cpu = p.detach().to("cpu")
-                        tensor_refs[pname] = ray.put(t_cpu)
+                        # Strip adapter name from key for vLLM compatibility
+                        # e.g., "lora_A.default.weight" -> "lora_A.weight"
+                        vllm_key = pname.replace(f".{first_name}.", ".")
+                        tensor_refs[vllm_key] = ray.put(t_cpu)
             else:
                 # No gather needed; only rank 0 exports
                 if is_rank0:
                     t_cpu = p.detach().to("cpu")
-                    tensor_refs[pname] = ray.put(t_cpu)
+                    # Strip adapter name from key for vLLM compatibility
+                    vllm_key = pname.replace(f".{first_name}.", ".")
+                    tensor_refs[vllm_key] = ray.put(t_cpu)
 
         # Only rank 0 returns the payload; other ranks return None
         if is_rank0:
@@ -500,6 +505,10 @@ class ActorPPOTrainer(ABC):
             ray.get(cache_reset_refs)
         torch.cuda.empty_cache()
         torch_dist_barrier_and_cuda_sync()
+
+    def get_current_lora_adapter_id(self) -> Optional[int]:
+        """Return the currently loaded LoRA adapter ID for vLLM generation."""
+        return self._last_lora_adapter_id if self._use_dynamic_lora else None
 
 
 @ray.remote(num_gpus=1)
@@ -708,6 +717,10 @@ class PolicyModelActor(BaseModelActor):
     def broadcast_to_vllm(self):
         self.trainer._broadcast_to_vllm()
 
+    def get_current_lora_adapter_id(self) -> Optional[int]:
+        """Return the currently loaded LoRA adapter ID for vLLM generation."""
+        return self.trainer.get_current_lora_adapter_id()
+
     def get_checkpoint_states(self):
         return self.checkpoint_states
 
@@ -787,7 +800,10 @@ class PolicyModelActor(BaseModelActor):
                     t_cpu = p.detach().to("cpu")
             else:
                 t_cpu = p.detach().to("cpu")
-            tensor_refs[pname] = ray.put(t_cpu)
+            # Strip adapter name from key for vLLM compatibility
+            # e.g., "lora_A.default.weight" -> "lora_A.weight"
+            vllm_key = pname.replace(f".{adapter_name}.", ".")
+            tensor_refs[vllm_key] = ray.put(t_cpu)
 
         payload = {"adapter_name": adapter_name, "config": adapter_config, "tensor_refs": tensor_refs}
         return ray.put(payload)
