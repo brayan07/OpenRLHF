@@ -17,6 +17,33 @@ from openrlhf.utils.agent import AgentExecutorBase
 from .vllm_engine import BaseLLMRayActor
 
 
+class AsyncEngineLoRAWrapper:
+    """Wrapper for AsyncLLMEngine that automatically injects active LoRA into generate() calls."""
+    
+    def __init__(self, engine, lora_request_getter):
+        """
+        Args:
+            engine: The vLLM AsyncLLMEngine instance
+            lora_request_getter: Callable that returns the current active LoRARequest
+        """
+        self._engine = engine
+        self._lora_request_getter = lora_request_getter
+    
+    async def generate(self, prompts, sampling_params, request_id, lora_request=None):
+        """Generate with automatic LoRA injection if not explicitly provided."""
+        # If no lora_request provided, use the active one
+        if lora_request is None:
+            lora_request = self._lora_request_getter()
+        
+        # Delegate to the real engine
+        async for output in self._engine.generate(prompts, sampling_params, request_id, lora_request=lora_request):
+            yield output
+    
+    def __getattr__(self, name):
+        """Forward all other attributes/methods to the wrapped engine."""
+        return getattr(self._engine, name)
+
+
 @ray.remote
 class LLMRayActorAsync(BaseLLMRayActor):
     async def __init__(self, *args, bundle_indices: list = None, **kwargs):
@@ -35,10 +62,16 @@ class LLMRayActorAsync(BaseLLMRayActor):
         assert version.parse(vllm.__version__) > version.parse("0.8.5"), "Asyn VLLM version must be greater than 0.8.5"
 
         engine_args = vllm.AsyncEngineArgs(*args, **self.kwargs)
-        self.llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
-        await self.llm.is_sleeping()
+        raw_engine = vllm.AsyncLLMEngine.from_engine_args(engine_args)
+        await raw_engine.is_sleeping()
+        
         # Track adapter metadata locally for logging/metrics
         self._lora_registry: dict[int, dict] = {}
+        # Track currently active LoRA for automatic injection
+        self._active_lora_request = None
+        
+        # Wrap the engine to automatically inject LoRA requests
+        self.llm = AsyncEngineLoRAWrapper(raw_engine, lambda: self._active_lora_request)
 
     async def init_process_group(
         self, master_address, master_port, rank_offset, world_size, group_name, backend, use_ray
@@ -149,6 +182,14 @@ class LLMRayActorAsync(BaseLLMRayActor):
             "name": adapter_name,
             "loaded_at_ts": time.time(),
         }
+        
+        # Set as active LoRA for automatic injection
+        # Note: lora_path is required by vLLM but not used for already-loaded adapters
+        self._active_lora_request = LoRARequest(
+            lora_name=adapter_name,
+            lora_int_id=adapter_id,
+            lora_path="__loaded__"  # Dummy path for already-loaded adapters
+        )
 
         return adapter_id
 

@@ -182,6 +182,8 @@ class LLMRayActor(BaseLLMRayActor):
         self.llm = vllm.LLM(*args, **self.kwargs)
         # Track adapter metadata locally for logging/metrics
         self._lora_registry: dict[int, dict] = {}
+        # Track currently active LoRA for automatic injection
+        self._active_lora_request = None
 
     def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend, use_ray):
         return self.llm.collective_rpc(
@@ -208,11 +210,17 @@ class LLMRayActor(BaseLLMRayActor):
         """
         Process requests from rank0 and generate responses.
         Since only rank0 will send requests, we don't need to track actor ranks.
+        Automatically injects the active LoRA request if one is loaded.
         """
         from vllm.inputs import TokensPrompt
 
         requests = [TokensPrompt(prompt_token_ids=r) for r in prompt_token_ids]
-        responses = self.llm.generate(prompts=requests, sampling_params=sampling_params)
+        # Automatically inject active LoRA request
+        responses = self.llm.generate(
+            prompts=requests, 
+            sampling_params=sampling_params,
+            lora_request=self._active_lora_request
+        )
         self.response_queues.put(responses)
 
     def get_responses(self):
@@ -230,9 +238,24 @@ class LLMRayActor(BaseLLMRayActor):
 
         Payload schema: {"adapter_name": str, "config": dict, "tensors": dict[str, torch.Tensor]}
         Returns: adapter_id (int)
+        
+        The loaded adapter becomes the active adapter for all subsequent generate() calls.
         """
+        from vllm.lora.request import LoRARequest
+        
         payload = ray.get(payload_ref) if isinstance(payload_ref, ray.ObjectRef) else payload_ref
-        return load_lora_from_payload_local(self.llm.llm_engine, payload, registry=self._lora_registry)
+        adapter_id = load_lora_from_payload_local(self.llm.llm_engine, payload, registry=self._lora_registry)
+        
+        # Set as active LoRA for automatic injection
+        # Note: lora_path is required by vLLM but not used for already-loaded adapters
+        adapter_name = payload.get("adapter_name", f"adapter-{adapter_id}")
+        self._active_lora_request = LoRARequest(
+            lora_name=adapter_name,
+            lora_int_id=adapter_id,
+            lora_path="__loaded__"  # Dummy path for already-loaded adapters
+        )
+        
+        return adapter_id
 
     def unload_lora_adapter(self, adapter_id: int) -> bool:
         return unload_lora_adapter_local(self.llm.llm_engine, adapter_id, registry=self._lora_registry)
