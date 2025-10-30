@@ -24,6 +24,7 @@ class BufferItem:
     advantages: (1)
     attention_mask: (S)
     action_mask: (A)
+    sft_loss_mask: (A)  # NEW: Mask for auxiliary SFT loss
 
     "A" is the number of actions.
     """
@@ -37,6 +38,7 @@ class BufferItem:
     advantages: torch.Tensor
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
+    sft_loss_mask: Optional[torch.Tensor]  # NEW: Mask for auxiliary SFT loss
     info: Optional[dict]
 
 

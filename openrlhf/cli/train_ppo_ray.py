@@ -123,7 +123,7 @@ def train(args):
             args.actor_num_gpus_per_node,
             PolicyModelActor,
             pg=pg,
-            num_gpus_per_actor=0.5 if pg else 1,
+            num_gpus_per_actor=0.20 if pg else 1,
             duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
         )
 
@@ -135,7 +135,7 @@ def train(args):
                 args.ref_num_gpus_per_node,
                 ReferenceModelActor,
                 pg=pg,
-                num_gpus_per_actor=0.5 if pg else 1,
+                num_gpus_per_actor=0.20 if pg else 1,
                 duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
             )
 
@@ -164,7 +164,7 @@ def train(args):
                 args.critic_num_gpus_per_node,
                 CriticModelActor,
                 pg=pg,
-                num_gpus_per_actor=0.5 if pg else 1,
+                num_gpus_per_actor=0.2 if pg else 1,
                 duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
             )
         else:
@@ -178,7 +178,7 @@ def train(args):
                 args.reward_num_gpus_per_node,
                 RewardModelActor,
                 pg=pg,
-                num_gpus_per_actor=0.5 if pg else 1,
+                num_gpus_per_actor=0.2 if pg else 1,
                 duplicate_actors=args.ring_attn_size * args.ds_tensor_parallel_size,
             )
         else:
@@ -273,6 +273,7 @@ def get_or_create_submission_actor(args, pg=None):
             submission_kwargs = {
                 "name": ARC_AGI_DEFAULT_SUBMISSION_NAME,
                 "lifetime": "detached",
+                "max_concurrency": 250
             }
             if ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS:
                 submission_kwargs["num_cpus"] = ARC_AGI_SUBMISSION_ACTOR_NUM_CPUS
@@ -593,6 +594,12 @@ def get_parser():
     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--l2", type=float, default=0.0, help="weight decay loss")
     parser.add_argument("--ptx_coef", type=float, default=0.05, help="PPO-ptx loss coef")
+    parser.add_argument(
+        "--aux_sft_coef",
+        type=float,
+        default=0.0,
+        help="Coefficient for auxiliary SFT loss on token ranges (set >0 to enable)",
+    )
     parser.add_argument("--eps_clip", type=float, default=0.2, help="PPO clip range")
     parser.add_argument("--eps_clip_low_high", type=float, nargs=2, default=None, help="PPO-clip low and high")
     parser.add_argument("--dual_clip", type=float, default=None, help="Dual-clip PPO")

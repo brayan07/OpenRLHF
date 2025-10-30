@@ -304,7 +304,7 @@ def create_vllm_engines(
     if use_hybrid_engine and tensor_parallel_size == 1:
         # every worker will use 0.2 GPU, so that we can schedule
         # 2 instances on the same GPUs.
-        num_gpus = 0.5
+        num_gpus = 0.2
 
     if not use_hybrid_engine:
         # Create a big placement group to ensure that all engines are packed
@@ -355,7 +355,7 @@ def create_vllm_engines(
                 full_determinism=full_determinism,
                 gpu_memory_utilization=gpu_memory_utilization,
                 bundle_indices=bundle_indices,
-                num_gpus=0.5 if use_hybrid_engine else 1,
+                num_gpus=0.2 if use_hybrid_engine else 1,
                 enable_sleep_mode=vllm_enable_sleep,
                 agent_func_path=agent_func_path,
                 # LoRA

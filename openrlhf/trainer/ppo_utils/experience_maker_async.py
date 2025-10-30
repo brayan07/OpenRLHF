@@ -87,10 +87,19 @@ class SamplesGeneratorAsync(SamplesGenerator):
             for start, end in tokenized_ranges:
                 action_mask[start:end] = 1
 
+            # Create SFT loss mask based on sft_token_ranges (NEW)
+            # Note: sft_token_ranges uses same convention as action_ranges: [start, exclusive_end]
+            # Always create as tensor (like action_mask), even if empty (all zeros)
+            sft_loss_mask = torch.zeros_like(attention_mask)
+            if "sft_token_ranges" in output and output["sft_token_ranges"]:
+                for start, end in output["sft_token_ranges"]:
+                    sft_loss_mask[start:end] = 1  # Exclusive end (matches action_mask convention)
+
             # Apply length limit
             sequences = sequences[:truncate_length].to("cpu")
             attention_mask = attention_mask[:truncate_length].to("cpu")
             action_mask = action_mask[1:truncate_length].to("cpu")
+            sft_loss_mask = sft_loss_mask[1:truncate_length].to("cpu")
             if output["rollout_log_probs"] is not None:
                 rollout_log_probs = torch.tensor(output["rollout_log_probs"][1:truncate_length]).to("cpu")
             else:
@@ -124,6 +133,7 @@ class SamplesGeneratorAsync(SamplesGenerator):
                 labels=[output["label"]],
                 rewards=torch.tensor([output["reward"]]),
                 scores=torch.tensor([output["scores"]]),
+                sft_loss_mask=sft_loss_mask.unsqueeze(0),
                 info=info,
             )
             experiences_list.append(experience)

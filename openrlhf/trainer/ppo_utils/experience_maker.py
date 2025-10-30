@@ -44,6 +44,7 @@ class Experience:
     returns: (B, S)
     advantages: (B, S)
     kl: (B, S)
+    sft_loss_mask: (B, S)  # NEW: Mask for auxiliary SFT loss
     info: dict[str, list]
     """
 
@@ -64,6 +65,7 @@ class Experience:
     labels: list[str] = None
     rewards: torch.Tensor = None  # used for advantage calculation
     scores: torch.Tensor = None  # 0-1 reward used for dynamic sampling
+    sft_loss_mask: torch.Tensor = None  # NEW: Mask for auxiliary SFT loss
 
     # the info field is used to store additional information
     # all the fields in the info will be logged to the tensorboard/wandb
@@ -86,6 +88,7 @@ class Experience:
         labels=None,
         rewards=None,
         scores=None,
+        sft_loss_mask=None,
         info=None,
     ):
         self.index = index
@@ -103,6 +106,7 @@ class Experience:
         self.labels = labels or []
         self.rewards = rewards
         self.scores = scores
+        self.sft_loss_mask = sft_loss_mask
         self.info = info or []
 
     @torch.no_grad()
@@ -158,6 +162,7 @@ class Experience:
             "labels": self.labels,
             "rewards": self.rewards,
             "scores": self.scores,
+            "sft_loss_mask": self.sft_loss_mask,
             "info": self.info,
         }
 

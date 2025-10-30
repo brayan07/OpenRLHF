@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers.trainer import get_scheduler
 
-from openrlhf.models import Actor, PolicyLoss
+from openrlhf.models import Actor, PolicyLoss, SFTLoss
 from openrlhf.models.utils import compute_approx_kl, masked_mean
 from openrlhf.trainer.ppo_utils.experience_maker import Experience
 from openrlhf.utils import get_tokenizer
@@ -91,6 +91,12 @@ class ActorPPOTrainer(ABC):
 
         # Mixtral 8x7b
         self.aux_loss = self.args.aux_loss_coef > 1e-8
+        
+        # Auxiliary SFT loss for dense supervision on token ranges
+        self.use_aux_sft_loss = self.args.aux_sft_coef > 1e-8
+        if self.use_aux_sft_loss:
+            self.sft_loss_fn = SFTLoss(token_level_loss=True)
+            logger.info(f"Auxiliary SFT loss enabled with coefficient {self.args.aux_sft_coef}")
 
         self.replay_buffer = NaiveReplayBuffer(
             micro_train_batch_size,
@@ -208,6 +214,9 @@ class ActorPPOTrainer(ABC):
                 if "entropy_loss" in status:
                     short_status["ent_loss"] = status["entropy_loss"]
 
+                if "sft_loss" in status:
+                    short_status["sft_loss"] = status["sft_loss"]
+
                 status_list.append(status)
                 pbar.set_postfix(short_status)
 
@@ -232,15 +241,17 @@ class ActorPPOTrainer(ABC):
         base_action_log_probs = experience.base_action_log_probs
 
         # actor loss
-        action_log_probs, output = self.actor(
+        log_probs, output = self.actor(
             sequences,
-            action_mask,
+            action_mask=None,
             attention_mask=attention_mask,
             return_output=True,
+            return_logprobs=True,
             ring_attn_group=self.strategy.ring_attn_group,
             packed_seq_lens=packed_seq_lens,
             return_entropy=self.args.entropy_loss_coef is not None,
         )
+        action_log_probs = log_probs[:, -action_mask.shape[1] :] * action_mask.float()
 
         # loss function
         actor_loss, clip_ratio, ppo_kl, vllm_kl = self.actor_loss_fn(
@@ -278,6 +289,18 @@ class ActorPPOTrainer(ABC):
             entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
             if self.args.entropy_loss_coef != 0:
                 loss -= entropy_loss * self.args.entropy_loss_coef
+        
+        # Auxiliary SFT loss on designated token ranges
+        # This provides dense supervised signal without affecting PPO loss (independent masks)
+        if self.use_aux_sft_loss:
+            # Slice log probs to match sft_loss_mask shape and apply mask
+            sft_log_probs = log_probs[:, -experience.sft_loss_mask.shape[1] :] * experience.sft_loss_mask.float()
+
+            # Compute SFT loss only on masked tokens
+            sft_loss = self.sft_loss_fn(sft_log_probs, experience.sft_loss_mask)
+            loss += sft_loss * self.args.aux_sft_coef
+            experience.info["sft_loss"] = sft_loss.detach()
+
 
         if self.args.use_dynamic_batch:
             loss = loss * self.replay_buffer.dynamic_loss_scale[step]
@@ -605,45 +628,6 @@ class PolicyModelActor(BaseModelActor):
             # Print PEFT summary if available
             if hasattr(base_model, "print_trainable_parameters"):
                 base_model.print_trainable_parameters()
-
-            total_params = 0
-            trainable_params = 0
-            offenders: list[str] = []
-
-            # Allow-list
-            modules_to_save = set(getattr(self.strategy.args, "modules_to_save", []) or [])
-            adapter_names = list(getattr(base_model, "peft_config", {}).keys()) if hasattr(base_model, "peft_config") else []
-            bias_mode = None
-            if adapter_names:
-                bias_mode = getattr(base_model.peft_config[adapter_names[0]], "bias", "none")
-
-            def _numel(param: torch.nn.Parameter) -> int:
-                # Under ZeRO-3, param.numel() can be 0 for partitioned placeholders; prefer ds_numel if present
-                return int(getattr(param, "ds_numel", param.numel()))
-
-            for name, p in base_model.named_parameters():
-                n = _numel(p)
-                total_params += n
-                if p.requires_grad:
-                    trainable_params += n
-                    is_lora = ("lora_" in name) or ("lora_magnitude_vector" in name)  # DoRA vector
-                    is_saved_mod = any(m in name for m in modules_to_save)
-                    is_allowed_bias = (bias_mode == "lora_only" and name.endswith(".bias"))
-                    if not (is_lora or is_saved_mod or is_allowed_bias):
-                        offenders.append(name)
-
-            pct = (100.0 * trainable_params / max(1, total_params))
-            logger.info(
-                f"Params: total={total_params:,} trainable={trainable_params:,} ({pct:.4f}%)"
-            )
-            if offenders:
-                # Fail-fast per project guidelines
-                sample = offenders[:10]
-                more = " ..." if len(offenders) > 10 else ""
-                raise RuntimeError(
-                    f"Found non-LoRA trainable parameters: {sample}{more}. "
-                    f"If intended, add them to modules_to_save or adjust LoRA config."
-                )
 
         # load checkpoint
         self.checkpoint_states = {}

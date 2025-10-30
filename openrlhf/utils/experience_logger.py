@@ -50,6 +50,7 @@ def _dict_to_experience(d: Dict[str, Any]) -> Experience:
         labels=d.get("labels"),
         rewards=d.get("rewards"),
         scores=d.get("scores"),
+        sft_loss_mask=d.get("sft_loss_mask"),
         info=d.get("info"),
     )
 
